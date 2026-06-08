@@ -510,20 +510,26 @@ def main() -> None:
         st.markdown(
             """
 Der AutoTrader soll nur handeln, wenn diese Bedingungen im WellenTektonik-Indikator erfüllt sind:
+Regel A:
 
-- CountColor = Blau oder Schwarz  
-- HasActive4 = Ja  
-- 4-Zone ist aktiv  
-- HarmonicPass = Ja  
-- Processing12Valid = Ja  
-- Count ist nicht ungültig  
-- Ziel 5 wurde noch nicht erreicht  
-- Entry an Level4  
-- Stop hinter Level4Plus +/- 1 Punkt  
-- Ziel Target5  
-- Risiko <= eingestelltes MaxRisk  
-- RiskTicks maximal 15  
-- 1 Kontrakt im ausgewählten Sierra-Chart-Trade-Account, standardmäßig SIM/Test
+Chart = 377 Tick
+CountColor = Gelb oder Schwarz oder Blau
+Rot ausschließen
+HarmonicStrongImpulse = Ja
+RiskTicks <= 70
+Entry Level4
+Stop hinter Level4Plus +/- 1 Punkt
+Target5
+
+Das heißt:
+
+Regel A handelt Gelb, Schwarz und Blau.
+Regel A braucht keine Gelb+Schwarz-Bestätigung.
+Regel A braucht HarmonicStrongImpulse = Ja.
+Regel A erlaubt RiskTicks bis 70.
+
+Handelbar sind mehrere Kontrakte in einer Richtung
+
 """
         )
         st.info("Dieses Dashboard wertet nur die exportierte CSV aus. Die eigentliche Entry- und Orderlogik liegt im ACSIL AutoTrader in Sierra Chart.")
