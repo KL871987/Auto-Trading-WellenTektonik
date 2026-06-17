@@ -318,25 +318,43 @@ def group_table(trades: pd.DataFrame, by: str) -> pd.DataFrame:
     return g
 
 
-def make_equity_chart(trades: pd.DataFrame) -> go.Figure:
+def make_net_pnl_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
+    """Netto-P/L-Verlauf und Drawdown gemeinsam in einem Liniendiagramm."""
     fig = go.Figure()
     if trades.empty:
         return fig
-    x = trades["DateTime"] if trades["DateTime"].notna().any() else trades.index
-    fig.add_trace(go.Scatter(x=x, y=trades["Equity"], mode="lines+markers", name="Equity"))
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark")
-    fig.update_yaxes(title_text="Kumulierte P/L")
-    return fig
 
-
-def make_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    if trades.empty:
-        return fig
     x = trades["DateTime"] if trades["DateTime"].notna().any() else trades.index
-    fig.add_trace(go.Scatter(x=x, y=trades["Drawdown"], mode="lines", name="Drawdown", fill="tozeroy"))
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark")
-    fig.update_yaxes(title_text="Drawdown")
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=trades["Equity"],
+            mode="lines+markers",
+            name="Netto P/L",
+            hovertemplate="%{x}<br>Netto P/L: %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=trades["Drawdown"],
+            mode="lines",
+            name="Drawdown",
+            hovertemplate="%{x}<br>Drawdown: %{y:,.2f}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="Netto P/L und Drawdown",
+        height=700,
+        margin=dict(l=10, r=10, t=45, b=10),
+        template="plotly_dark",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_yaxes(title_text="Netto P/L / Drawdown")
+    fig.add_hline(y=0, line_width=1, line_dash="dot")
     return fig
 
 
@@ -454,8 +472,7 @@ def main() -> None:
     with tab_overview:
         c1, c2 = st.columns([2, 1])
         with c1:
-            st.plotly_chart(make_equity_chart(filtered), use_container_width=True)
-            st.plotly_chart(make_drawdown_chart(filtered), use_container_width=True)
+            st.plotly_chart(make_net_pnl_drawdown_chart(filtered), use_container_width=True)
         with c2:
             st.plotly_chart(make_daily_bar(filtered), use_container_width=True)
             st.plotly_chart(make_color_direction_chart(filtered), use_container_width=True)
@@ -510,26 +527,20 @@ def main() -> None:
         st.markdown(
             """
 Der AutoTrader soll nur handeln, wenn diese Bedingungen im WellenTektonik-Indikator erfüllt sind:
-Regel A:
 
-Chart = 377 Tick
-CountColor = Gelb oder Schwarz oder Blau
-Rot ausschließen
-HarmonicStrongImpulse = Ja
-RiskTicks <= 70
-Entry Level4
-Stop hinter Level4Plus +/- 1 Punkt
-Target5
-
-Das heißt:
-
-Regel A handelt Gelb, Schwarz und Blau.
-Regel A braucht keine Gelb+Schwarz-Bestätigung.
-Regel A braucht HarmonicStrongImpulse = Ja.
-Regel A erlaubt RiskTicks bis 70.
-
-Handelbar sind mehrere Kontrakte in einer Richtung
-
+- CountColor = Blau oder Schwarz  
+- HasActive4 = Ja  
+- 4-Zone ist aktiv  
+- HarmonicPass = Ja  
+- Processing12Valid = Ja  
+- Count ist nicht ungültig  
+- Ziel 5 wurde noch nicht erreicht  
+- Entry an Level4  
+- Stop hinter Level4Plus +/- 1 Punkt  
+- Ziel Target5  
+- Risiko <= eingestelltes MaxRisk  
+- RiskTicks maximal 15  
+- 1 Kontrakt im ausgewählten Sierra-Chart-Trade-Account, standardmäßig SIM/Test
 """
         )
         st.info("Dieses Dashboard wertet nur die exportierte CSV aus. Die eigentliche Entry- und Orderlogik liegt im ACSIL AutoTrader in Sierra Chart.")
