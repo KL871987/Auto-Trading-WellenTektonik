@@ -202,16 +202,14 @@ def prepare_trades(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.sort_values(["DateTime", "TradeID"], na_position="last").reset_index(drop=True)
 
-    # Equity berechnen. Falls CumPNL fehlt/0 bleibt, wird aus PNL_Currency kumuliert.
-    if out["CumPNL_Currency"].abs().sum() == 0 and out["PNL_Currency"].abs().sum() != 0:
-        out["Equity"] = out["PNL_Currency"].cumsum()
-    else:
-        out["Equity"] = out["CumPNL_Currency"]
-        # Wenn einzelne Nullwerte vorkommen, trotzdem mit eigener Kurve auffüllen.
-        if out["Equity"].abs().sum() == 0:
-            out["Equity"] = out["PNL_Currency"].cumsum()
+    # Netto-P/L immer aus den geschlossenen Einzeltrades aufbauen.
+    # Dadurch endet die Kurve exakt beim KPI "Netto P/L" und wird nicht durch
+    # eventuell zurückgesetzte/inkonsistente CumPNL_Currency-Werte verfälscht.
+    out["Equity"] = out["PNL_Currency"].cumsum()
 
-    out["EquityHigh"] = out["Equity"].cummax()
+    # Drawdown vom jeweils bisherigen Netto-P/L-Höchststand.
+    # Die Startlinie 0 wird als erster möglicher Höchststand berücksichtigt.
+    out["EquityHigh"] = out["Equity"].cummax().clip(lower=0.0)
     out["Drawdown"] = out["Equity"] - out["EquityHigh"]
     out["Win"] = out["PNL_Currency"] > 0
     out["Loss"] = out["PNL_Currency"] < 0
@@ -319,7 +317,7 @@ def group_table(trades: pd.DataFrame, by: str) -> pd.DataFrame:
 
 
 def make_net_pnl_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
-    """Netto-P/L-Verlauf und Drawdown gemeinsam in einem Liniendiagramm."""
+    """Netto-P/L und Drawdown exakt im Stil der gewünschten Skizze."""
     fig = go.Figure()
     if trades.empty:
         return fig
@@ -332,7 +330,9 @@ def make_net_pnl_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
             y=trades["Equity"],
             mode="lines+markers",
             name="Netto P/L",
-            hovertemplate="%{x}<br>Netto P/L: %{y:,.2f}<extra></extra>",
+            line=dict(color="#1f77b4", width=2),
+            marker=dict(color="#1f77b4", size=5),
+            hovertemplate="%{x|%d.%m.%Y %H:%M}<br>Netto P/L: %{y:,.2f} $<extra></extra>",
         )
     )
     fig.add_trace(
@@ -341,20 +341,67 @@ def make_net_pnl_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
             y=trades["Drawdown"],
             mode="lines",
             name="Drawdown",
-            hovertemplate="%{x}<br>Drawdown: %{y:,.2f}<extra></extra>",
+            line=dict(color="#ff7f0e", width=2),
+            hovertemplate="%{x|%d.%m.%Y %H:%M}<br>Drawdown: %{y:,.2f} $<extra></extra>",
         )
     )
 
-    fig.update_layout(
-        title="Netto P/L und Drawdown",
-        height=700,
-        margin=dict(l=10, r=10, t=45, b=10),
-        template="plotly_dark",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    fig.add_hline(
+        y=0,
+        line_width=1,
+        line_dash="dash",
+        line_color="#1f77b4",
     )
-    fig.update_yaxes(title_text="Netto P/L / Drawdown")
-    fig.add_hline(y=0, line_width=1, line_dash="dot")
+
+    fig.update_layout(
+        title=dict(
+            text="Netto P/L und Drawdown",
+            x=0.5,
+            xanchor="center",
+            y=0.98,
+            yanchor="top",
+            font=dict(size=22, color="#111111"),
+        ),
+        height=650,
+        margin=dict(l=70, r=25, t=70, b=80),
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        hovermode="x unified",
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=0.98,
+            xanchor="left",
+            x=0.01,
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="rgba(120,120,120,0.45)",
+            borderwidth=1,
+            font=dict(color="#111111"),
+            title_text="",
+        ),
+        font=dict(color="#111111"),
+    )
+    fig.update_xaxes(
+        title_text="Zeit",
+        tickformat="%Y-%m-%d",
+        tickangle=-30,
+        showgrid=True,
+        gridcolor="rgba(180,180,180,0.35)",
+        zeroline=False,
+        linecolor="#444444",
+        title_font=dict(color="#111111"),
+        tickfont=dict(color="#111111"),
+    )
+    fig.update_yaxes(
+        title_text="Netto P/L / Drawdown",
+        showgrid=True,
+        gridcolor="rgba(180,180,180,0.35)",
+        zeroline=False,
+        linecolor="#444444",
+        title_font=dict(color="#111111"),
+        tickfont=dict(color="#111111"),
+    )
     return fig
 
 
@@ -363,8 +410,8 @@ def make_daily_bar(trades: pd.DataFrame) -> go.Figure:
         return go.Figure()
     daily = trades.groupby("Day", dropna=False)["PNL_Currency"].sum().reset_index()
     daily["Day"] = daily["Day"].astype(str)
-    fig = px.bar(daily, x="Day", y="PNL_Currency", title="Tages P/L", template="plotly_dark")
-    fig.update_layout(height=330, margin=dict(l=10, r=10, t=40, b=10))
+    fig = px.bar(daily, x="Day", y="PNL_Currency", title=None, template="plotly_dark")
+    fig.update_layout(height=285, margin=dict(l=10, r=10, t=10, b=10))
     return fig
 
 
@@ -372,8 +419,8 @@ def make_color_direction_chart(trades: pd.DataFrame) -> go.Figure:
     if trades.empty:
         return go.Figure()
     view = trades.groupby(["CountColor", "Direction"], dropna=False)["PNL_Currency"].sum().reset_index()
-    fig = px.bar(view, x="CountColor", y="PNL_Currency", color="Direction", barmode="group", title="P/L nach CountColor und Richtung", template="plotly_dark")
-    fig.update_layout(height=330, margin=dict(l=10, r=10, t=40, b=10))
+    fig = px.bar(view, x="CountColor", y="PNL_Currency", color="Direction", barmode="group", title=None, template="plotly_dark")
+    fig.update_layout(height=285, margin=dict(l=10, r=10, t=10, b=10))
     return fig
 
 
@@ -470,11 +517,13 @@ def main() -> None:
     ])
 
     with tab_overview:
-        c1, c2 = st.columns([2, 1])
+        c1, c2 = st.columns([2, 1], gap="large")
         with c1:
             st.plotly_chart(make_net_pnl_drawdown_chart(filtered), use_container_width=True)
         with c2:
+            st.markdown("#### Tages P/L")
             st.plotly_chart(make_daily_bar(filtered), use_container_width=True)
+            st.markdown("#### P/L nach CountColor und Richtung")
             st.plotly_chart(make_color_direction_chart(filtered), use_container_width=True)
 
     with tab_periods:
