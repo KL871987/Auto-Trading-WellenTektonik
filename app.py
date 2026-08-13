@@ -32,7 +32,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -364,8 +364,14 @@ def normalize_algo_from_notes(notes: Any) -> str:
 
 
 def derive_algo_name(row: pd.Series) -> str:
-    # Future-proof: when exporters later add an explicit strategy/algo column,
-    # the dashboard uses it automatically without code changes.
+    # In this Sierra setup the TradeAccount (Sim1, Sim2, ... / later live account IDs)
+    # is the authoritative algorithm identifier. CountColor is only a tag and Notes
+    # describe strategy/module metadata; neither may replace an existing Sim account.
+    account = clean_label(row.get("TradeAccount", ""), "")
+    if account:
+        return account
+
+    # Fallbacks only matter for future/foreign exports that do not contain TradeAccount.
     explicit = _first_nonempty(
         row,
         ["Algo", "Algorithm", "AlgorithmName", "Strategy", "StrategyName", "System", "Model", "AlgoName"],
@@ -381,9 +387,6 @@ def derive_algo_name(row: pd.Series) -> str:
     if legacy and legacy.lower() not in {"portfolio", "blau", "schwarz", "blue", "black", "nicht angegeben"}:
         return legacy
 
-    account = clean_label(row.get("TradeAccount", ""), "")
-    if account:
-        return f"Algo {account}"
     return "Unbekannter Algo"
 
 
@@ -924,7 +927,10 @@ def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
 
     out = trades.copy()
 
-    algos = sorted(out["Algo"].dropna().astype(str).unique().tolist())
+    def _natural_algo_sort_key(value: str):
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
+
+    algos = sorted(out["Algo"].dropna().astype(str).unique().tolist(), key=_natural_algo_sort_key)
     selected_algos = st.sidebar.multiselect("Algorithmen", algos, default=algos)
     if selected_algos and len(selected_algos) != len(algos):
         out = out[out["Algo"].isin(selected_algos)]
@@ -1153,14 +1159,14 @@ def system_tab(raw_df: pd.DataFrame, trades: pd.DataFrame, filtered: pd.DataFram
     st.markdown('<div class="wt-section-title">Dynamische Algo-Erkennung</div>', unsafe_allow_html=True)
     st.markdown(
         """
-Das Dashboard hat **keine fest codierte Liste von Strategien**. Es nutzt in dieser Reihenfolge:
+Das Dashboard hat **keine fest codierte Liste von Strategien**. Für diese Sierra-Chart-Daten gilt:
 
-1. explizite CSV-Felder wie `Algo`, `Strategy`, `System` oder `Model`, falls sie künftig vorhanden sind,
-2. den Strategie-Namen aus `Notes`,
-3. einen aussagekräftigen Legacy-Tag aus `CountColor`,
-4. als Fallback den `TradeAccount`.
+1. `TradeAccount` ist die **verbindliche Algo-ID** (`Sim1`, `Sim2`, …).
+2. `Notes` liefert Strategie-/Versions-/Modul-Metadaten, ersetzt aber niemals eine vorhandene Sim-ID.
+3. `CountColor` ist nur ein Legacy-/Kategorie-Tag (z. B. `MAE-200`, `Gelb`) und **kein Algorithmusname**.
+4. Nur wenn `TradeAccount` fehlt, werden explizite Algo-Felder, `Notes` und zuletzt `CountColor` als Fallback verwendet.
 
-Damit können Algos herausfallen oder neu hinzukommen, ohne dass die Dashboard-Logik jedes Mal angepasst werden muss.
+Damit erscheinen neue Sim-/Algo-Accounts automatisch und entfernte Accounts verschwinden automatisch, ohne eine fest codierte Liste.
 """
     )
 
