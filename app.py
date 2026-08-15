@@ -37,9 +37,13 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.11"
+APP_VERSION = "2.0.13"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
+
+# Separate access protection for the sensitive Data Quality & Korrektur tab.
+# Requested as a fixed password in code.
+DATA_QUALITY_PASSWORD = "Hallo123"
 
 # Dashboard palette only. It does not alter source data.
 BG = "#070a10"
@@ -1669,7 +1673,61 @@ def risk_tab(filtered: pd.DataFrame, risk_limit_ticks: float) -> None:
             st.dataframe(violations[show].sort_values("DateTime", ascending=False), use_container_width=True, hide_index=True)
 
 
+def require_trades_audit_access() -> bool:
+    """Gate the Trades & Audit area behind the same fixed password.
+
+    Authentication is remembered only for the current Streamlit browser session.
+    This is intentionally separate from the Data Quality unlock state, so each
+    protected tab can be locked/unlocked independently.
+    """
+    auth_key = "trades_audit_auth_ok"
+
+    if st.session_state.get(auth_key) is True:
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.success("Trades & Audit ist entsperrt.")
+        with c2:
+            if st.button("Bereich sperren", key="lock_trades_audit", use_container_width=True):
+                st.session_state[auth_key] = False
+                st.rerun()
+        return True
+
+    st.markdown(
+        '<div class="wt-section-title">🔒 Trades & Audit</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Dieser Bereich ist geschützt. Bitte Passwort eingeben, '
+        'um den vollständigen Trade Audit Trail und die technischen Detailfelder anzuzeigen.</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("trades_audit_login_form", clear_on_submit=True):
+        entered = st.text_input(
+            "Passwort",
+            type="password",
+            placeholder="Passwort eingeben",
+            key="trades_audit_password_input",
+        )
+        submitted = st.form_submit_button(
+            "Trades & Audit entsperren",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if entered == DATA_QUALITY_PASSWORD:
+            st.session_state[auth_key] = True
+            st.rerun()
+        else:
+            st.error("Passwort falsch.")
+
+    return False
+
+
 def trades_tab(filtered: pd.DataFrame) -> None:
+    if not require_trades_audit_access():
+        return
     st.markdown('<div class="wt-section-title">Trade Audit Trail</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="wt-section-sub">Nur geschlossene Trades. Technische Detailfelder bleiben für Nachvollziehbarkeit und Export erhalten.</div>',
@@ -2295,7 +2353,60 @@ def style_pnl_quality_table(df: pd.DataFrame):
     return styled
 
 
+def require_data_quality_access() -> bool:
+    """Gate the Data Quality & Korrektur area behind its own password.
+
+    Authentication is remembered only in the current Streamlit browser session.
+    The user can explicitly lock the area again at any time.
+    """
+    auth_key = "data_quality_auth_ok"
+
+    if st.session_state.get(auth_key) is True:
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.success("Data Quality & Korrektur ist entsperrt.")
+        with c2:
+            if st.button("Bereich sperren", key="lock_data_quality", use_container_width=True):
+                st.session_state[auth_key] = False
+                st.rerun()
+        return True
+
+    st.markdown(
+        '<div class="wt-section-title">🔒 Data Quality & Korrektur</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Dieser Bereich ist geschützt. Bitte Passwort eingeben, um die detaillierten '
+        'BlueBlack-Prüfungen, Sim-Fehler und CSV-Zeilen anzuzeigen.</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("data_quality_login_form", clear_on_submit=True):
+        entered = st.text_input(
+            "Passwort",
+            type="password",
+            placeholder="Passwort eingeben",
+            key="data_quality_password_input",
+        )
+        submitted = st.form_submit_button(
+            "Data Quality entsperren",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if entered == DATA_QUALITY_PASSWORD:
+            st.session_state[auth_key] = True
+            st.rerun()
+        else:
+            st.error("Passwort falsch.")
+
+    return False
+
+
 def data_quality_tab(raw_df: pd.DataFrame) -> None:
+    if not require_data_quality_access():
+        return
     report = build_data_quality_report(raw_df)
     metrics = report["metrics"]
 
