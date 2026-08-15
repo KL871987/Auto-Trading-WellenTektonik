@@ -37,7 +37,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.14"
+APP_VERSION = "2.0.15"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -1486,25 +1486,6 @@ def source_status(info: Dict[str, Any], raw_df: pd.DataFrame, trades: pd.DataFra
     latest = latest_trade_label(trades)
     
 
-def show_data_quality_banner(raw_df: pd.DataFrame) -> None:
-    """Compact always-visible source-vs-dashboard control status."""
-    report = build_data_quality_report(raw_df)
-    m = report.get("metrics", {})
-    source_status = m.get("status", "NO DATA")
-    dashboard_status = m.get("dashboard_status", "–")
-    corrected = int(m.get("auto_corrected", 0))
-    fallback = int(m.get("safely_handled", 0))
-    info_entries = int(m.get("duplicate_entry_groups", 0))
-    if source_status == "OK":
-        st.success(f"DATA QUALITY · Quelle OK · Dashboard {dashboard_status} · keine Korrekturen nötig")
-    else:
-        st.info(
-            f"DATA QUALITY · Quelle {source_status} · Dashboard {dashboard_status} · "
-            f"{corrected} automatisch korrigierte Quellauffälligkeiten · {fallback} sicher behandelte/Fallback-Fälle · "
-            f"{info_entries} Multi-ENTRY-Info. Details im Tab Data Quality."
-        )
-
-
 def executive_tab(filtered: pd.DataFrame, summary: Dict[str, Any]) -> None:
     st.markdown('<div class="wt-section-title">Portfolio Performance</div>', unsafe_allow_html=True)
     st.markdown(
@@ -2725,7 +2706,6 @@ def main() -> None:
 
     show_hero(summary, filtered)
     show_kpis(summary)
-    show_data_quality_banner(raw_df)
 
     tabs = st.tabs([
         "Executive",
