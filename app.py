@@ -7,10 +7,11 @@ Key principles:
 - P/L is rebuilt from CLOSED/EXIT trades only.
 - Equity and drawdown are recalculated AFTER every dashboard filter so the
   headline P/L and the chart always end at the same value.
-- Strategy/algo names are discovered dynamically from explicit CSV columns,
-  Notes, CountColor or (last resort) TradeAccount. No static algo list is used.
+- TradeAccount is the authoritative algorithm identifier (Sim1, Sim2, ...).
 - New algos therefore appear automatically; removed algos simply stop producing
   new trades and remain available in historical periods.
+- Multi-algo P/L and drawdown curves use a stable per-algo color mapping.
+- Planned Risk:Reward is derived from RewardTicks / RiskTicks on closed trades.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -48,6 +49,15 @@ POSITIVE = "#2ed18a"
 NEGATIVE = "#ff5f72"
 WARNING = "#f3c969"
 GRID = "rgba(143,155,173,0.14)"
+
+# Stable, high-contrast algorithm colors for the dark dashboard.
+# The same algorithm receives the same color in all multi-algo line charts.
+ALGO_COLORS = [
+    "#6AA7FF", "#2ED18A", "#F3C969", "#FF6B81", "#A88BFF",
+    "#43D4FF", "#FF9F43", "#B8E986", "#E76BF3", "#7FDBFF",
+    "#FF8A65", "#4DD0E1", "#C0CA33", "#AB47BC", "#FFA726",
+    "#26A69A", "#EC407A", "#90A4AE", "#D4E157", "#5C6BC0",
+]
 
 
 @dataclass
@@ -748,6 +758,176 @@ def make_algo_pnl_chart(trades: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _algo_path_frame(group: pd.DataFrame, value_kind: str, global_start: Any, global_end: Any) -> Tuple[list, list]:
+    """Build a step-like algo path that stays visible across the selected time window."""
+    g = group.sort_values(["DateTime", "TradeID"], na_position="last").copy()
+    pnl = pd.to_numeric(g["PNL_Currency"], errors="coerce").fillna(0.0)
+    equity = pnl.cumsum()
+    if value_kind == "drawdown":
+        high = equity.cummax().clip(lower=0.0)
+        values = equity - high
+    else:
+        values = equity
+
+    if g["DateTime"].notna().any():
+        valid = g["DateTime"].notna()
+        x = g.loc[valid, "DateTime"].tolist()
+        y = values.loc[valid].astype(float).tolist()
+        if not x:
+            return [], []
+        start = global_start if pd.notna(global_start) else x[0]
+        end = global_end if pd.notna(global_end) else x[-1]
+        # Start every algo at zero and carry its latest value to the end of the
+        # selected window. This also makes one-trade algos visible as a line.
+        append_end = bool(pd.notna(end) and end != x[-1])
+        x = [start] + x + ([end] if append_end else [])
+        y = [0.0] + y + ([y[-1]] if append_end else [])
+        return x, y
+
+    # Fallback for foreign exports without timestamps.
+    y = values.astype(float).tolist()
+    return list(range(0, len(y) + 1)), [0.0] + y
+
+
+def make_multi_algo_pnl_chart(trades: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if trades.empty:
+        return fig
+
+    cmap = algo_color_map(trades)
+    algos = sorted(cmap, key=natural_algo_sort_key)
+    valid_times = trades["DateTime"].dropna() if "DateTime" in trades else pd.Series(dtype="datetime64[ns]")
+    global_start = valid_times.min() if len(valid_times) else pd.NaT
+    global_end = valid_times.max() if len(valid_times) else pd.NaT
+
+    for algo in algos:
+        g = trades[trades["Algo"] == algo]
+        x, y = _algo_path_frame(g, "equity", global_start, global_end)
+        if not x:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines+markers",
+                name=algo,
+                line=dict(color=cmap[algo], width=2.7, shape="hv"),
+                marker=dict(color=cmap[algo], size=4, line=dict(width=0)),
+                hovertemplate=f"<b>{html.escape(algo)}</b><br>%{{x|%d.%m.%Y %H:%M}}<br>Cum. P/L: %{{y:,.2f}} $<extra></extra>",
+                connectgaps=False,
+            )
+        )
+
+    layout = _base_layout()
+    layout.update(
+        height=max(460, min(700, 390 + 20 * len(algos))),
+        hovermode="x unified",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
+        margin=dict(l=55, r=30, t=80, b=55),
+    )
+    fig.update_layout(**layout)
+    fig.add_hline(y=0, line_width=1.2, line_color=BORDER)
+    fig.update_xaxes(showgrid=False, tickformat="%d.%m\n%H:%M", title="Zeit", rangeslider_visible=False)
+    fig.update_yaxes(gridcolor=GRID, zeroline=False, title="Kumuliertes P/L ($)")
+    return fig
+
+
+def make_multi_algo_drawdown_chart(trades: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if trades.empty:
+        return fig
+
+    cmap = algo_color_map(trades)
+    algos = sorted(cmap, key=natural_algo_sort_key)
+    valid_times = trades["DateTime"].dropna() if "DateTime" in trades else pd.Series(dtype="datetime64[ns]")
+    global_start = valid_times.min() if len(valid_times) else pd.NaT
+    global_end = valid_times.max() if len(valid_times) else pd.NaT
+
+    for algo in algos:
+        g = trades[trades["Algo"] == algo]
+        x, y = _algo_path_frame(g, "drawdown", global_start, global_end)
+        if not x:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines+markers",
+                name=algo,
+                line=dict(color=cmap[algo], width=2.7, shape="hv"),
+                marker=dict(color=cmap[algo], size=4, line=dict(width=0)),
+                hovertemplate=f"<b>{html.escape(algo)}</b><br>%{{x|%d.%m.%Y %H:%M}}<br>Drawdown: %{{y:,.2f}} $<extra></extra>",
+                connectgaps=False,
+            )
+        )
+
+    layout = _base_layout()
+    layout.update(
+        height=max(460, min(700, 390 + 20 * len(algos))),
+        hovermode="x unified",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
+        margin=dict(l=55, r=30, t=80, b=55),
+    )
+    fig.update_layout(**layout)
+    fig.add_hline(y=0, line_width=1.2, line_color=BORDER)
+    fig.update_xaxes(showgrid=False, tickformat="%d.%m\n%H:%M", title="Zeit", rangeslider_visible=False)
+    fig.update_yaxes(gridcolor=GRID, zeroline=False, title="Drawdown ($)")
+    return fig
+
+
+def risk_reward_table(trades: pd.DataFrame) -> pd.DataFrame:
+    """Per-algo planned Risk:Reward based on exported RiskTicks and RewardTicks."""
+    if trades.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for algo, g in trades.groupby("Algo", dropna=False):
+        risk = pd.to_numeric(g["RiskTicks"], errors="coerce")
+        reward = pd.to_numeric(g["RewardTicks"], errors="coerce")
+        valid = risk.gt(0) & reward.gt(0)
+        vrisk = risk[valid]
+        vreward = reward[valid]
+        avg_risk = float(vrisk.mean()) if len(vrisk) else float("nan")
+        avg_reward = float(vreward.mean()) if len(vreward) else float("nan")
+        per_trade_rr = (vreward / vrisk).replace([float("inf"), float("-inf")], pd.NA).dropna()
+        rr = float(per_trade_rr.mean()) if len(per_trade_rr) else float("nan")
+
+        pnl = pd.to_numeric(g["PNL_Currency"], errors="coerce").fillna(0.0)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        avg_win = float(wins.mean()) if len(wins) else float("nan")
+        avg_loss = float(losses.mean()) if len(losses) else float("nan")
+        realized = avg_win / abs(avg_loss) if pd.notna(avg_win) and pd.notna(avg_loss) and avg_loss < 0 else float("nan")
+
+        rows.append({
+            "Algo": algo,
+            "Trades": int(len(g)),
+            "R:R Samples": int(valid.sum()),
+            "Ø Risk (Ticks)": avg_risk,
+            "Ø Reward (Ticks)": avg_reward,
+            "Ø Risk : Reward": f"1 : {rr:.2f}" if pd.notna(rr) else "–",
+            "Realized Payoff": realized,
+        })
+
+    out = pd.DataFrame(rows)
+    out["_sort"] = out["Algo"].map(natural_algo_sort_key)
+    out = out.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
+    return out
+
+
+def style_risk_reward_table(df: pd.DataFrame):
+    if df.empty:
+        return df
+    styled = df.style.format({
+        "Ø Risk (Ticks)": lambda x: "–" if pd.isna(x) else f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", "."),
+        "Ø Reward (Ticks)": lambda x: "–" if pd.isna(x) else f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", "."),
+        "Realized Payoff": lambda x: "–" if pd.isna(x) else f"{x:.2f}",
+    })
+    return styled
+
+
 def make_direction_chart(trades: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if trades.empty:
@@ -911,6 +1091,28 @@ def style_performance_table(df: pd.DataFrame):
     return styled
 
 
+def natural_algo_sort_key(value: str):
+    """Natural sort so Sim2 is ordered before Sim10."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
+
+
+def algo_color_map(trades: pd.DataFrame) -> Dict[str, str]:
+    """Stable color per algo; filtering other algos does not change its color."""
+    algos = sorted(
+        trades.get("Algo", pd.Series(dtype=str)).dropna().astype(str).unique().tolist(),
+        key=natural_algo_sort_key,
+    )
+    colors: Dict[str, str] = {}
+    for algo in algos:
+        sim_match = re.fullmatch(r"\s*sim\s*(\d+)\s*", algo, flags=re.IGNORECASE)
+        if sim_match:
+            idx = max(0, int(sim_match.group(1)) - 1)
+        else:
+            idx = sum((i + 1) * ord(ch) for i, ch in enumerate(algo))
+        colors[algo] = ALGO_COLORS[idx % len(ALGO_COLORS)]
+    return colors
+
+
 def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
     st.sidebar.markdown("### Portfolio Filter")
     st.sidebar.caption("Alle Filter wirken identisch auf KPI, Tabellen und Equity-Kurve.")
@@ -927,10 +1129,7 @@ def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
 
     out = trades.copy()
 
-    def _natural_algo_sort_key(value: str):
-        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(value))]
-
-    algos = sorted(out["Algo"].dropna().astype(str).unique().tolist(), key=_natural_algo_sort_key)
+    algos = sorted(out["Algo"].dropna().astype(str).unique().tolist(), key=natural_algo_sort_key)
     selected_algos = st.sidebar.multiselect("Algorithmen", algos, default=algos)
     if selected_algos and len(selected_algos) != len(algos):
         out = out[out["Algo"].isin(selected_algos)]
@@ -1054,6 +1253,43 @@ def algos_tab(filtered: pd.DataFrame) -> None:
 
     st.markdown('<div class="wt-section-title">Algo Contribution</div>', unsafe_allow_html=True)
     st.plotly_chart(make_algo_pnl_chart(filtered), use_container_width=True, config={"displayModeBar": False}, key="algos_algo_contribution")
+
+    st.markdown('<div class="wt-section-title">Kumuliertes P/L je Algorithmus</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Jeder Algo besitzt eine feste Farbe. Die Step-Linien zeigen ausschließlich realisierte Closed-Trade-P/L und bleiben auch bei wenigen Trades klar sichtbar.</div>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(
+        make_multi_algo_pnl_chart(filtered),
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key="algos_multi_equity",
+    )
+
+    st.markdown('<div class="wt-section-title">Drawdown je Algorithmus</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Drawdown wird für jeden Algo separat aus seiner eigenen kumulierten Equity-Kurve berechnet. Die Farben entsprechen exakt dem P/L-Chart.</div>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(
+        make_multi_algo_drawdown_chart(filtered),
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key="algos_multi_drawdown",
+    )
+
+    st.markdown('<div class="wt-section-title">Risk-to-Reward je Algorithmus</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Ø Risk : Reward basiert auf dem durchschnittlichen RewardTicks/RiskTicks-Verhältnis der gültigen Trades. Beispiel 1 : 3,00 bedeutet 1 Einheit geplantes Risiko zu 3 Einheiten geplantem Reward. Realized Payoff = Ø Gewinner / |Ø Verlierer|.</div>',
+        unsafe_allow_html=True,
+    )
+    rr_table = risk_reward_table(filtered)
+    st.dataframe(
+        style_risk_reward_table(rr_table),
+        use_container_width=True,
+        hide_index=True,
+        height=min(520, 80 + 38 * len(rr_table)),
+    )
 
     algo = st.selectbox("Algo Detail", table["Algo"].tolist(), index=0)
     detail = recompute_curve(filtered[filtered["Algo"] == algo], risk_limit_ticks=10**9)
