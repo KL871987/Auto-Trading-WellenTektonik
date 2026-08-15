@@ -12,6 +12,10 @@ Key principles:
   new trades and remain available in historical periods.
 - Multi-algo P/L and drawdown curves use a stable per-algo color mapping.
 - Planned Risk:Reward is derived from RewardTicks / RiskTicks on closed trades.
+- P/L is standardized from PNL_Ticks to ES (12.50 USD/tick, default) or MES (1.25 USD/tick).
+- Duplicate closed-trade export rows are removed before any KPI is calculated.
+- Dedicated Data Quality diagnostics identify the affected Sim/account and exact CSV source line(s).
+- Global session view can be switched between Globex (RTH + ETH, default), RTH, and ETH.
 """
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.11"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -58,6 +62,22 @@ ALGO_COLORS = [
     "#FF8A65", "#4DD0E1", "#C0CA33", "#AB47BC", "#FFA726",
     "#26A69A", "#EC407A", "#90A4AE", "#D4E157", "#5C6BC0",
 ]
+
+# Standardized USD value per Sierra "tick" for S&P 500 futures.
+# The dashboard can normalize a mixed ES/MES trade history to either basis.
+CONTRACT_TICK_VALUES = {
+    "MES": 1.25,
+    "ES": 12.50,
+}
+DEFAULT_DISPLAY_CONTRACT = "ES"
+
+# Session display control. Sierra timestamps are interpreted as Central Time (CT).
+# RTH: 08:30 <= entry/signal time < 15:00 CT. ETH: all remaining valid Globex times.
+# "Globex" is the union of RTH + ETH and is the default dashboard view.
+SESSION_CHOICES = ["Globex", "RTH", "ETH"]
+DEFAULT_SESSION_VIEW = "Globex"
+RTH_START_MINUTE = 8 * 60 + 30
+RTH_END_MINUTE = 15 * 60
 
 
 @dataclass
@@ -269,6 +289,108 @@ def clean_label(value: Any, fallback: str = "Nicht angegeben") -> str:
     return text
 
 
+def detect_contract_from_symbol(symbol: Any) -> str:
+    """Identify MES vs ES from common Sierra/CQG symbols.
+
+    Examples used in this project:
+    - F.US.MESU26 -> MES
+    - F.US.EPU26  -> ES (CQG EP root for E-mini S&P)
+    """
+    text = clean_label(symbol, "").upper().replace(" ", "")
+    if not text:
+        return "UNKNOWN"
+
+    # MES must be tested first because it also contains the letters "ES".
+    if "MES" in text:
+        return "MES"
+
+    tail = text.split(".")[-1]
+    tail = re.sub(r"^\[SIM\]", "", tail)
+    if tail.startswith("EP") or tail.startswith("ES"):
+        return "ES"
+
+    # Additional common forms such as [Sim]F.US.EPU26.
+    if re.search(r"(?:^|\.)EP[A-Z]\d{1,2}$", text) or re.search(r"(?:^|\.)ES[A-Z]\d{1,2}$", text):
+        return "ES"
+    return "UNKNOWN"
+
+
+def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.DataFrame:
+    """Standardize monetary P/L to the selected ES or MES tick basis.
+
+    PNL_Ticks is the canonical realized price result. Therefore every trade with
+    a non-zero tick result is displayed as:
+
+        PNL_Ticks × selected tick value
+
+    This makes the ES/MES selector deterministic and prevents mixed/incorrect
+    source-dollar scaling from changing portfolio statistics. The original
+    exported dollar P/L is preserved only for audit in PNL_Currency_Source.
+
+    ExportTickValue and PNL_Adjustment_Source describe how the source row appears
+    to have been monetized; they never alter standardized dashboard P/L.
+    """
+    contract = str(display_contract or DEFAULT_DISPLAY_CONTRACT).upper().strip()
+    if contract not in CONTRACT_TICK_VALUES:
+        contract = DEFAULT_DISPLAY_CONTRACT
+    target_tick_value = float(CONTRACT_TICK_VALUES[contract])
+
+    result = out.copy()
+    result["PNL_Currency_Source"] = pd.to_numeric(
+        result.get("PNL_Currency", 0.0), errors="coerce"
+    ).fillna(0.0)
+    result["SourceContract"] = result.get(
+        "Symbol", pd.Series("", index=result.index)
+    ).map(detect_contract_from_symbol)
+    result["DisplayContract"] = contract
+    result["DisplayTickValue"] = target_tick_value
+
+    ticks = pd.to_numeric(result.get("PNL_Ticks", 0.0), errors="coerce").fillna(0.0)
+    source_pnl = result["PNL_Currency_Source"]
+
+    # Audit-only inference of the source monetary basis.
+    observed_ratio = (source_pnl.abs() / ticks.abs().replace(0.0, pd.NA)).astype("Float64")
+
+    def nearest_known_tick(value: Any) -> float:
+        try:
+            v = float(value)
+        except Exception:
+            return float("nan")
+        if not pd.notna(v) or v <= 0:
+            return float("nan")
+        candidates = list(CONTRACT_TICK_VALUES.values())
+        nearest = min(candidates, key=lambda x: abs(v - x))
+        if abs(v - nearest) / nearest <= 0.20:
+            return float(nearest)
+        return float("nan")
+
+    export_tick_value = observed_ratio.map(nearest_known_tick)
+    symbol_tick_value = result["SourceContract"].map(CONTRACT_TICK_VALUES).astype("Float64")
+    export_tick_value = export_tick_value.fillna(symbol_tick_value).fillna(target_tick_value).astype(float)
+    result["ExportTickValue"] = export_tick_value
+
+    source_tick_component = ticks * export_tick_value
+    result["PNL_Adjustment_Source"] = (source_pnl - source_tick_component).astype(float)
+
+    # Canonical standardized display P/L. No source-dollar residual is carried
+    # into performance figures because the requested ES/MES view is a pure
+    # tick-value normalization.
+    normalized = ticks * target_tick_value
+
+    # If a legacy row has non-zero dollars but zero ticks, PNL_Ticks cannot be
+    # used. Only for that exceptional row do we scale the source monetary value
+    # by its inferred/source contract basis.
+    fallback_mask = (ticks == 0.0) & (source_pnl != 0.0)
+    if fallback_mask.any():
+        base_tick = pd.to_numeric(export_tick_value, errors="coerce").replace(0.0, pd.NA)
+        factor = target_tick_value / base_tick
+        fallback = source_pnl * factor.fillna(1.0)
+        normalized = normalized.where(~fallback_mask, fallback)
+
+    result["PNL_Currency"] = normalized.astype(float)
+    return result
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_from_github(owner: str, repo: str, branch: str, data_path: str, token: str) -> Tuple[str, Dict[str, Any]]:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{data_path}"
@@ -324,10 +446,22 @@ def parse_csv(text: str) -> pd.DataFrame:
         return pd.DataFrame()
     dialect = detect_dialect(text)
     df = pd.read_csv(io.StringIO(text), sep=dialect.delimiter, dtype=str, keep_default_na=False)
-    df.columns = [str(c).strip() for c in df.columns]
+
+    # Some Sierra exporters append legacy semicolons to the Notes header/value.
+    # They are not field separators in this comma-delimited file and should not
+    # become part of the logical column name.
+    df.columns = [re.sub(r";+$", "", str(c).strip()) for c in df.columns]
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.strip()
+    if "Notes" in df.columns:
+        df["Notes"] = df["Notes"].astype(str).str.replace(r";+$", "", regex=True).str.strip()
+
+    # Physical source-line reference for audit. The CSV header is line 1, so the
+    # first data record is line 2. BlueBlack exports in this project are
+    # one-record-per-line, which makes this a reliable operator reference.
+    if "CSVLine" not in df.columns:
+        df["CSVLine"] = range(2, len(df) + 2)
     return df
 
 
@@ -400,7 +534,80 @@ def derive_algo_name(row: pd.Series) -> str:
     return "Unbekannter Algo"
 
 
-def prepare_trades(df: pd.DataFrame) -> pd.DataFrame:
+def assign_trade_session(out: pd.DataFrame) -> pd.DataFrame:
+    """Assign every closed trade to RTH or ETH using its entry/signal timestamp.
+
+    Priority:
+    1. If a future export contains an explicit RTH/ETH session field, use it.
+    2. Otherwise use EntryDateTime from the matching ENTRY row when available.
+    3. Fall back to SignalDateTime, then finally to the EXIT DateTime.
+
+    Sierra timestamps in this project are interpreted as Central Time (CT).
+    RTH is 08:30 inclusive to 15:00 exclusive. ETH is the remaining Globex time.
+    "Globex" itself is a dashboard view (RTH + ETH), not a per-trade label.
+    """
+    result = out.copy()
+    if result.empty:
+        result["SessionDateTime"] = pd.Series(dtype="datetime64[ns]")
+        result["TradeSession"] = pd.Series(dtype=str)
+        return result
+
+    entry_dt = result.get("EntryDateTime", pd.Series(pd.NaT, index=result.index))
+    signal_dt = result.get("SignalDateTime", pd.Series(pd.NaT, index=result.index))
+    exit_dt = result.get("DateTime", pd.Series(pd.NaT, index=result.index))
+    result["SessionDateTime"] = entry_dt.where(entry_dt.notna(), signal_dt).where(
+        entry_dt.notna() | signal_dt.notna(), exit_dt
+    )
+
+    session_dt = result["SessionDateTime"]
+    minute_of_day = session_dt.dt.hour * 60 + session_dt.dt.minute
+    valid_dt = session_dt.notna()
+    is_rth = valid_dt & (minute_of_day >= RTH_START_MINUTE) & (minute_of_day < RTH_END_MINUTE)
+
+    result["TradeSession"] = "UNKNOWN"
+    result.loc[valid_dt & ~is_rth, "TradeSession"] = "ETH"
+    result.loc[is_rth, "TradeSession"] = "RTH"
+
+    # Honor an explicit per-trade session label if a future source file provides one.
+    # Values such as Globex are intentionally ignored because Globex = RTH + ETH here.
+    for source_col in ["Session", "SessionType", "TradingSession", "MarketSession"]:
+        if source_col not in result.columns:
+            continue
+        explicit = result[source_col].astype(str).str.upper().str.strip()
+        explicit = explicit.replace({
+            "REGULAR": "RTH",
+            "REGULAR HOURS": "RTH",
+            "REGULAR TRADING HOURS": "RTH",
+            "EXTENDED": "ETH",
+            "EXTENDED HOURS": "ETH",
+            "EXTENDED TRADING HOURS": "ETH",
+        })
+        mask = explicit.isin(["RTH", "ETH"])
+        result.loc[mask, "TradeSession"] = explicit.loc[mask]
+
+    return result
+
+
+def deduplicate_closed_rows(out: pd.DataFrame) -> pd.DataFrame:
+    """Preserve every closed EXIT row.
+
+    IMPORTANT:
+    In this Sierra setup an algo may legitimately place two or more limit orders
+    at the same level. Those orders can be entered and exited with identical
+    price/time/P&L fields. Therefore same-looking trades are NOT duplicates by
+    definition and must never be removed automatically.
+
+    The Data Quality tab may show repeated-looking ENTRY/EXIT groups as INFO for
+    transparency, but all rows remain in the performance calculation.
+
+    A future source-level duplicate-removal rule may only be enabled if the
+    export provides a genuinely unique execution/order identifier that proves
+    two rows are the same physical execution record.
+    """
+    return out.copy()
+
+
+def prepare_trades(df: pd.DataFrame, display_contract: str = DEFAULT_DISPLAY_CONTRACT) -> pd.DataFrame:
     if df.empty:
         return df
 
@@ -409,9 +616,39 @@ def prepare_trades(df: pd.DataFrame) -> pd.DataFrame:
         out["RowType"] = "EXIT"
 
     out["RowType"] = out["RowType"].astype(str).str.upper().str.strip()
+
+    # Preserve the actual ENTRY timestamp before reducing the dataset to closed rows.
+    # TradeID alone is not globally unique across Sim accounts, so the lookup key is
+    # (TradeAccount, TradeID). This avoids assigning an entry from another algo/account.
+    raw_trade_id = safe_col(out, "TradeID", "").astype(str).str.strip()
+    raw_account = safe_col(out, "TradeAccount", "").astype(str).str.strip()
+    raw_datetime = pd.to_datetime(safe_col(out, "DateTime", ""), errors="coerce")
+    entry_mask = out["RowType"].isin(["ENTRY", "OPEN", "TRADE_ENTRY", "B"])
+    raw_csv_line = pd.to_numeric(safe_col(out, "CSVLine", 0), errors="coerce").fillna(0).astype(int)
+    entry_lookup_df = pd.DataFrame({
+        "TradeAccount": raw_account[entry_mask],
+        "TradeID": raw_trade_id[entry_mask],
+        "EntryDateTime": raw_datetime[entry_mask],
+        "EntryCSVLine": raw_csv_line[entry_mask],
+    })
+    entry_lookup_df = entry_lookup_df[
+        (entry_lookup_df["TradeAccount"] != "")
+        & (entry_lookup_df["TradeID"] != "")
+        & entry_lookup_df["EntryDateTime"].notna()
+    ]
+    if not entry_lookup_df.empty:
+        entry_lookup_df = (
+            entry_lookup_df.sort_values("EntryDateTime")
+            .drop_duplicates(["TradeAccount", "TradeID"], keep="first")
+        )
+
     out = out[out["RowType"].isin(["EXIT", "CLOSE", "CLOSED", "TRADE_EXIT", "E"])]
     if out.empty:
         return out
+
+    # Preserve every EXIT row. Same-looking rows may be legitimate executions
+    # from multiple limit orders at the same level and must not be collapsed.
+    out = deduplicate_closed_rows(out)
 
     numeric_cols = [
         "EntryLevel4", "EntryFillPrice", "ExitPrice", "StopPrice", "TargetPrice",
@@ -423,8 +660,12 @@ def prepare_trades(df: pd.DataFrame) -> pd.DataFrame:
 
     out["DateTime"] = pd.to_datetime(safe_col(out, "DateTime", ""), errors="coerce")
     out["SignalDateTime"] = pd.to_datetime(safe_col(out, "SignalDateTime", ""), errors="coerce")
-    out["TradeID"] = safe_col(out, "TradeID", "").astype(str)
+    out["TradeID"] = safe_col(out, "TradeID", "").astype(str).str.strip()
     out["TradeAccount"] = safe_col(out, "TradeAccount", "").map(clean_label)
+    if not entry_lookup_df.empty:
+        out = out.merge(entry_lookup_df, on=["TradeAccount", "TradeID"], how="left")
+    else:
+        out["EntryDateTime"] = pd.NaT
     out["Symbol"] = safe_col(out, "Symbol", "").map(clean_label)
     out["CountColor"] = (
         safe_col(out, "CountColor", "")
@@ -438,6 +679,13 @@ def prepare_trades(df: pd.DataFrame) -> pd.DataFrame:
     out["Algo"] = out.apply(derive_algo_name, axis=1)
     out["AlgoVersion"] = out["Notes"].map(extract_version)
     out["Module"] = out["Notes"].map(extract_module)
+
+    # Classify session from the entry/signal timestamp before any dashboard filter is applied.
+    out = assign_trade_session(out)
+
+    # Reprice every closed trade to the selected ES/MES display basis before any
+    # KPI, equity, drawdown or strategy aggregation is calculated.
+    out = normalize_pnl_to_contract(out, display_contract)
 
     out["Win"] = out["PNL_Currency"] > 0
     out["Loss"] = out["PNL_Currency"] < 0
@@ -580,9 +828,15 @@ def latest_trade_label(trades: pd.DataFrame) -> str:
     return trades["DateTime"].max().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def show_header(trades: pd.DataFrame, info: Dict[str, Any]) -> None:
+def show_header(trades: pd.DataFrame, info: Dict[str, Any], session_view: str = DEFAULT_SESSION_VIEW) -> None:
     mode = execution_mode(trades)
     dot_class = "sim" if mode == "SIMULATION" else ""
+    display_contract = DEFAULT_DISPLAY_CONTRACT
+    if not trades.empty and "DisplayContract" in trades.columns:
+        display_contract = clean_label(trades["DisplayContract"].iloc[0], DEFAULT_DISPLAY_CONTRACT).upper()
+    tick_value = CONTRACT_TICK_VALUES.get(display_contract, CONTRACT_TICK_VALUES[DEFAULT_DISPLAY_CONTRACT])
+    basis_label = f"{display_contract} · {num(tick_value, 2)} $/Tick"
+    session_badge = "GLOBEX" if session_view == "Globex" else session_view.upper()
     st.markdown(
         f"""
         <div class="wt-topline">
@@ -591,7 +845,7 @@ def show_header(trades: pd.DataFrame, info: Dict[str, Any]) -> None:
             <div class="wt-title">Portfolio Analytics</div>
             <div class="wt-subtitle">Multi-Strategy · Realized P/L · Risk & Execution Audit</div>
           </div>
-          <div class="wt-badge"><span class="wt-dot {dot_class}"></span>{html.escape(mode)} · v{APP_VERSION}</div>
+          <div class="wt-badge"><span class="wt-dot {dot_class}"></span>{html.escape(mode)} · {html.escape(session_badge)} · {html.escape(basis_label)} · v{APP_VERSION}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1113,7 +1367,18 @@ def algo_color_map(trades: pd.DataFrame) -> Dict[str, str]:
     return colors
 
 
-def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
+def sidebar_filters(trades: pd.DataFrame, session_view: str = DEFAULT_SESSION_VIEW) -> Tuple[pd.DataFrame, float]:
+    """Apply dashboard filters without leaking widget state between sessions.
+
+    Streamlit keeps widget values in session_state. In older dashboard versions,
+    changing RTH -> ETH/Globex could leave stale algorithm/technical-filter values
+    from the previous session. Those values were then applied to the new session
+    and could incorrectly produce an empty result set.
+
+    Every session now owns its own filter-state keys. Switching between Globex,
+    RTH and ETH therefore starts from the correct defaults for that session and
+    remembers later user choices independently.
+    """
     st.sidebar.markdown("### Portfolio Filter")
     st.sidebar.caption("Alle Filter wirken identisch auf KPI, Tabellen und Equity-Kurve.")
 
@@ -1125,12 +1390,27 @@ def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
         value=float(risk_default),
         step=1.0,
         help="Nur für den Risk-Monitor. Die Strategie-Logik in Sierra Chart wird dadurch nicht verändert.",
+        key="global_risk_limit_ticks",
     )
 
     out = trades.copy()
 
+    # Apply the selected global session first.
+    if session_view in {"RTH", "ETH"} and "TradeSession" in out.columns:
+        out = out[out["TradeSession"] == session_view]
+
+    # IMPORTANT: each session gets independent widget keys. This prevents an
+    # RTH selection from becoming an invalid hidden filter after switching to ETH
+    # or Globex.
+    session_key = str(session_view).lower()
+
     algos = sorted(out["Algo"].dropna().astype(str).unique().tolist(), key=natural_algo_sort_key)
-    selected_algos = st.sidebar.multiselect("Algorithmen", algos, default=algos)
+    selected_algos = st.sidebar.multiselect(
+        "Algorithmen",
+        algos,
+        default=algos,
+        key=f"algorithms_{session_key}",
+    )
     if selected_algos and len(selected_algos) != len(algos):
         out = out[out["Algo"].isin(selected_algos)]
     elif not selected_algos and algos:
@@ -1144,12 +1424,16 @@ def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date,
+            key=f"date_range_{session_key}",
         )
         if isinstance(dr, tuple) and len(dr) == 2:
             start, end = dr
             out = out[(out["DateTime"].dt.date >= start) & (out["DateTime"].dt.date <= end)]
 
     with st.sidebar.expander("Technische Filter", expanded=False):
+        # TradeSession is intentionally NOT repeated here: the dedicated global
+        # Session selector already controls Globex/RTH/ETH. A second hidden
+        # TradeSession multiselect was the main source of stale-state conflicts.
         for col, label in [
             ("TradeAccount", "Trade Account"),
             ("Symbol", "Symbol"),
@@ -1158,7 +1442,12 @@ def sidebar_filters(trades: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
             ("Module", "Modul"),
         ]:
             options = sorted(out[col].dropna().astype(str).unique().tolist()) if col in out else []
-            selected = st.multiselect(label, options, default=options, key=f"filter_{col}")
+            selected = st.multiselect(
+                label,
+                options,
+                default=options,
+                key=f"filter_{session_key}_{col}",
+            )
             if selected and len(selected) != len(options):
                 out = out[out[col].isin(selected)]
             elif not selected and options:
@@ -1203,6 +1492,25 @@ def source_status(info: Dict[str, Any], raw_df: pd.DataFrame, trades: pd.DataFra
         """,
         unsafe_allow_html=True,
     )
+
+
+def show_data_quality_banner(raw_df: pd.DataFrame) -> None:
+    """Compact always-visible source-vs-dashboard control status."""
+    report = build_data_quality_report(raw_df)
+    m = report.get("metrics", {})
+    source_status = m.get("status", "NO DATA")
+    dashboard_status = m.get("dashboard_status", "–")
+    corrected = int(m.get("auto_corrected", 0))
+    fallback = int(m.get("safely_handled", 0))
+    info_entries = int(m.get("duplicate_entry_groups", 0))
+    if source_status == "OK":
+        st.success(f"DATA QUALITY · Quelle OK · Dashboard {dashboard_status} · keine Korrekturen nötig")
+    else:
+        st.info(
+            f"DATA QUALITY · Quelle {source_status} · Dashboard {dashboard_status} · "
+            f"{corrected} automatisch korrigierte Quellauffälligkeiten · {fallback} sicher behandelte/Fallback-Fälle · "
+            f"{info_entries} Multi-ENTRY-Info. Details im Tab Data Quality."
+        )
 
 
 def executive_tab(filtered: pd.DataFrame, summary: Dict[str, Any]) -> None:
@@ -1357,7 +1665,7 @@ def risk_tab(filtered: pd.DataFrame, risk_limit_ticks: float) -> None:
 
     if len(violations):
         with st.expander(f"{len(violations)} Risk-Monitor Treffer anzeigen", expanded=False):
-            show = [c for c in ["DateTime", "Algo", "Module", "TradeAccount", "Direction", "RiskTicks", "PNL_Currency", "ExitReason", "TradeID"] if c in violations.columns]
+            show = [c for c in ["DateTime", "EntryDateTime", "SessionDateTime", "TradeSession", "Algo", "Module", "TradeAccount", "Direction", "RiskTicks", "PNL_Currency", "ExitReason", "TradeID"] if c in violations.columns]
             st.dataframe(violations[show].sort_values("DateTime", ascending=False), use_container_width=True, hide_index=True)
 
 
@@ -1368,9 +1676,11 @@ def trades_tab(filtered: pd.DataFrame) -> None:
         unsafe_allow_html=True,
     )
     cols = [
-        "DateTime", "TradeID", "Algo", "AlgoVersion", "Module", "TradeAccount", "Symbol", "CountColor", "Direction",
+        "CSVLine", "EntryCSVLine", "DateTime", "EntryDateTime", "SessionDateTime", "TradeSession", "TradeID", "Algo", "AlgoVersion", "Module", "TradeAccount", "Symbol", "CountColor", "Direction",
         "EntryFillPrice", "ExitPrice", "StopPrice", "TargetPrice", "RiskTicks", "RewardTicks", "Quantity",
-        "PNL_Ticks", "PNL_Currency", "MAE_Ticks", "MFE_Ticks", "ExitReason", "Equity", "Drawdown", "Notes",
+        "PNL_Ticks", "PNL_Currency", "PNL_Currency_Source", "PNL_Adjustment_Source", "ExportTickValue",
+        "SourceContract", "DisplayContract", "DisplayTickValue",
+        "MAE_Ticks", "MFE_Ticks", "ExitReason", "Equity", "Drawdown", "Notes",
     ]
     show_cols = [c for c in cols if c in filtered.columns]
     st.dataframe(
@@ -1388,7 +1698,757 @@ def trades_tab(filtered: pd.DataFrame) -> None:
     )
 
 
-def system_tab(raw_df: pd.DataFrame, trades: pd.DataFrame, filtered: pd.DataFrame, info: Dict[str, Any]) -> None:
+
+def _quality_money(value: Any) -> str:
+    try:
+        if pd.isna(value):
+            return "–"
+        return money(float(value))
+    except Exception:
+        return "–"
+
+
+def _quality_float(value: Any, decimals: int = 2) -> str:
+    try:
+        if pd.isna(value):
+            return "–"
+        return num(float(value), decimals)
+    except Exception:
+        return "–"
+
+
+def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
+    """Audit the unmodified BlueBlack source and retain exact CSV line references.
+
+    The audit deliberately runs on raw rows *before* EXIT deduplication so the
+    operator can see exactly which Sim/account and source line caused an issue.
+
+    Severity model:
+    - FEHLER: source inconsistency that should be corrected in the exporter/file.
+    - WARNUNG: plausible small monetary residual or unknown/ambiguous metadata.
+    - INFO: operationally valid pattern worth showing for transparency.
+    - OK: no hard issue detected for that Sim in the checks below.
+
+    Important Sierra behavior:
+    Multiple ENTRY and EXIT rows can be fully valid because an algo may place
+    and fill more than one limit order at the same level. Therefore repeated-looking
+    ENTRY/EXIT core fields are informational only and NEVER lower the Data Quality
+    status by themselves. The dashboard keeps every closed EXIT in performance.
+
+    Only a future source record with a truly unique execution/order identifier
+    proving that two rows are the same physical execution may be auto-deduplicated.
+    """
+    empty = {
+        "summary": pd.DataFrame(),
+        "issues": pd.DataFrame(),
+        "duplicate_entries": pd.DataFrame(),
+        "duplicate_exits": pd.DataFrame(),
+        "pnl_checks": pd.DataFrame(),
+        "missing_exits": pd.DataFrame(),
+        "missing_entries": pd.DataFrame(),
+        "structural": pd.DataFrame(),
+        "metrics": {
+            "source_rows": 0, "entries": 0, "exits": 0,
+            "duplicate_entry_groups": 0, "duplicate_entry_extra_rows": 0,
+            "duplicate_exit_groups": 0, "duplicate_exit_extra_rows": 0,
+            "pnl_errors": 0, "pnl_warnings": 0,
+            "missing_exit": 0, "missing_entry": 0, "structural_errors": 0,
+            "status": "NO DATA",
+        },
+    }
+    if raw_df.empty:
+        return empty
+
+    df = raw_df.copy()
+    if "CSVLine" not in df.columns:
+        df["CSVLine"] = range(2, len(df) + 2)
+    df["CSVLine"] = pd.to_numeric(df["CSVLine"], errors="coerce").fillna(0).astype(int)
+
+    if "RowType" not in df.columns:
+        df["RowType"] = "EXIT"
+    df["_RowType"] = safe_col(df, "RowType", "").astype(str).str.upper().str.strip()
+    df["_Account"] = safe_col(df, "TradeAccount", "").astype(str).str.strip()
+    df["_TradeID"] = safe_col(df, "TradeID", "").astype(str).str.strip()
+    df["_Symbol"] = safe_col(df, "Symbol", "").astype(str).str.strip()
+    df["_DateTimeParsed"] = pd.to_datetime(safe_col(df, "DateTime", ""), errors="coerce")
+    df["_PNL_Ticks"] = pd.to_numeric(safe_col(df, "PNL_Ticks", ""), errors="coerce")
+    df["_PNL_Currency"] = pd.to_numeric(safe_col(df, "PNL_Currency", ""), errors="coerce")
+    df["_ExitPrice"] = pd.to_numeric(safe_col(df, "ExitPrice", ""), errors="coerce")
+    df["_EntryFillPrice"] = pd.to_numeric(safe_col(df, "EntryFillPrice", ""), errors="coerce")
+    df["_Quantity"] = pd.to_numeric(safe_col(df, "Quantity", ""), errors="coerce")
+
+    entry_types = ["ENTRY", "OPEN", "TRADE_ENTRY", "B"]
+    exit_types = ["EXIT", "CLOSE", "CLOSED", "TRADE_EXIT", "E"]
+    entries = df[df["_RowType"].isin(entry_types)].copy()
+    exits = df[df["_RowType"].isin(exit_types)].copy()
+
+    issue_rows = []
+    duplicate_entry_rows = []
+    duplicate_exit_rows = []
+    pnl_rows = []
+    missing_exit_rows = []
+    missing_entry_rows = []
+    structural_rows = []
+
+    def account_label(value: Any) -> str:
+        return clean_label(value, "Ohne Account")
+
+    def add_issue(
+        severity: str,
+        category: str,
+        sim: str,
+        csv_lines: str,
+        trade_id: str = "",
+        symbol: str = "",
+        dt: str = "",
+        details: str = "",
+    ) -> None:
+        issue_rows.append({
+            "Schweregrad": severity,
+            "Kategorie": category,
+            "Sim / Account": sim,
+            "CSV-Zeile(n)": csv_lines,
+            "TradeID": trade_id,
+            "Symbol": symbol,
+            "DateTime": dt,
+            "Details": details,
+        })
+
+    # ------------------------------------------------------------------
+    # 1) Same-looking ENTRY / EXIT groups (INFO only; possible Multi-Limit execution)
+    # ------------------------------------------------------------------
+    entry_dup_key = [
+        "_Account", "_TradeID", "DateTime", "Symbol", "Direction",
+        "EntryFillPrice", "Quantity",
+    ]
+    exit_dup_key = [
+        "_Account", "_TradeID", "DateTime", "Symbol", "Direction", "Quantity",
+        "ExitReason", "PNL_Ticks", "PNL_Currency", "ExitPrice",
+    ]
+
+    def duplicate_groups(frame: pd.DataFrame, key_cols: list, kind: str) -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame()
+        work = frame.copy()
+        for col in key_cols:
+            if col not in work.columns:
+                work[col] = ""
+        mask = work.duplicated(key_cols, keep=False)
+        if not mask.any():
+            return pd.DataFrame()
+
+        rows = []
+        for _, group in work[mask].groupby(key_cols, dropna=False, sort=False):
+            group = group.sort_values("CSVLine", kind="stable")
+            lines = [int(x) for x in group["CSVLine"].tolist()]
+            sim = account_label(group["_Account"].iloc[0])
+            trade_id = clean_label(group["_TradeID"].iloc[0], "")
+            symbol = clean_label(group["_Symbol"].iloc[0], "")
+            dt = clean_label(group.get("DateTime", pd.Series([""])).iloc[0], "")
+            notes_len = safe_col(group, "Notes", "").astype(str).str.len()
+            keep_idx = group.assign(__notes_len=notes_len).sort_values(
+                ["__notes_len", "CSVLine"], kind="stable"
+            ).index[-1]
+            keep_line = int(group.loc[keep_idx, "CSVLine"])
+            removed = [line for line in lines if line != keep_line]
+
+            row = {
+                "Sim / Account": sim,
+                "TradeID": trade_id,
+                "Symbol": symbol,
+                "DateTime": dt,
+                "CSV-Zeilen": ", ".join(map(str, lines)),
+                "Anzahl": int(len(group)),
+            }
+            if kind == "EXIT":
+                row.update({
+                    "PNL_Ticks": normalize_number(group.get("PNL_Ticks", pd.Series([0])).iloc[0]),
+                    "PNL_Currency_Source": normalize_number(group.get("PNL_Currency", pd.Series([0])).iloc[0]),
+                    "ExitPrice": normalize_number(group.get("ExitPrice", pd.Series([0])).iloc[0]),
+                    "Bewertung": "INFO – zulässiges Multi-Exit / Multi-Limit-Muster",
+                    "Dashboard-Korrektur": "KEINE – alle EXIT-Zeilen bleiben als eigene geschlossene Trades erhalten",
+                })
+                add_issue(
+                    "INFO",
+                    "Mehrfach-EXIT (zulässig)",
+                    sim,
+                    ", ".join(map(str, lines)),
+                    trade_id,
+                    symbol,
+                    dt,
+                    f"{len(group)} EXIT-Zeilen besitzen gleiche Kernfelder. Das ist kein Fehler: "
+                    "mehrere Limit-Orders können am selben Level ausgeführt und später mit identischen "
+                    "Exitdaten geschlossen werden. Keine Zeile wird entfernt; alle Trades bleiben im P/L.",
+                )
+            else:
+                row.update({
+                    "EntryFillPrice": normalize_number(group.get("EntryFillPrice", pd.Series([0])).iloc[0]),
+                    "Quantity": normalize_number(group.get("Quantity", pd.Series([0])).iloc[0]),
+                    "Bewertung": "INFO – zulässiges Multi-Entry / Multi-Limit-Muster",
+                })
+                add_issue(
+                    "INFO",
+                    "Mehrfach-ENTRY (zulässig)",
+                    sim,
+                    ", ".join(map(str, lines)),
+                    trade_id,
+                    symbol,
+                    dt,
+                    f"{len(group)} ENTRY-Zeilen besitzen gleiche Kernfelder. Das ist kein Fehler: "
+                    "mehrere Limits können am selben Level liegen bzw. gefüllt werden. "
+                    "Die Zeilen werden im Audit nur zur Transparenz angezeigt und nicht als Data-Quality-Fehler gewertet.",
+                )
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    duplicate_entries = duplicate_groups(entries, entry_dup_key, "ENTRY")
+    duplicate_exits = duplicate_groups(exits, exit_dup_key, "EXIT")
+    duplicate_entry_rows = duplicate_entries.to_dict("records") if not duplicate_entries.empty else []
+    duplicate_exit_rows = duplicate_exits.to_dict("records") if not duplicate_exits.empty else []
+
+    # ------------------------------------------------------------------
+    # 2) ENTRY without EXIT / EXIT without ENTRY
+    # Pairing is account + TradeID, because TradeID alone is not global.
+    # ------------------------------------------------------------------
+    valid_entries = entries[(entries["_Account"] != "") & (entries["_TradeID"] != "")].copy()
+    valid_exits = exits[(exits["_Account"] != "") & (exits["_TradeID"] != "")].copy()
+
+    entry_keys = set(zip(valid_entries["_Account"], valid_entries["_TradeID"]))
+    exit_keys = set(zip(valid_exits["_Account"], valid_exits["_TradeID"]))
+
+    for account, trade_id in sorted(entry_keys - exit_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
+        g = valid_entries[(valid_entries["_Account"] == account) & (valid_entries["_TradeID"] == trade_id)]
+        lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
+        row = {
+            "Sim / Account": account_label(account),
+            "TradeID": trade_id,
+            "ENTRY CSV-Zeile(n)": lines,
+            "ENTRY DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
+            "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
+            "Fehler": "ENTRY vorhanden, EXIT fehlt",
+        }
+        missing_exit_rows.append(row)
+        add_issue(
+            "FEHLER", "ENTRY ohne EXIT", account_label(account), lines, trade_id,
+            row["Symbol"], row["ENTRY DateTime"],
+            "Trade wurde eröffnet/exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert kein EXIT.",
+        )
+
+    for account, trade_id in sorted(exit_keys - entry_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
+        g = valid_exits[(valid_exits["_Account"] == account) & (valid_exits["_TradeID"] == trade_id)]
+        lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
+        row = {
+            "Sim / Account": account_label(account),
+            "TradeID": trade_id,
+            "EXIT CSV-Zeile(n)": lines,
+            "EXIT DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
+            "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
+            "Fehler": "EXIT vorhanden, ENTRY fehlt",
+        }
+        missing_entry_rows.append(row)
+        add_issue(
+            "FEHLER", "EXIT ohne ENTRY", account_label(account), lines, trade_id,
+            row["Symbol"], row["EXIT DateTime"],
+            "Geschlossener Trade wurde exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert keine ENTRY-Zeile.",
+        )
+
+    # ------------------------------------------------------------------
+    # 3) P/L plausibility: source dollars vs symbol contract tick value.
+    # The dashboard performance still uses canonical PNL_Ticks, but source
+    # inconsistencies are surfaced here rather than silently trusted.
+    # ------------------------------------------------------------------
+    for _, row in exits.iterrows():
+        sim = account_label(row["_Account"])
+        trade_id = clean_label(row["_TradeID"], "")
+        symbol = clean_label(row["_Symbol"], "")
+        csv_line = int(row["CSVLine"])
+        dt = clean_label(row.get("DateTime", ""), "")
+        ticks = row["_PNL_Ticks"]
+        source_pnl = row["_PNL_Currency"]
+        source_contract = detect_contract_from_symbol(symbol)
+        expected_tick = CONTRACT_TICK_VALUES.get(source_contract)
+
+        if pd.isna(ticks) or pd.isna(source_pnl):
+            continue
+
+        if float(ticks) == 0.0 and abs(float(source_pnl)) > 0.01:
+            pnl_row = {
+                "Schweregrad": "FEHLER",
+                "Sim / Account": sim,
+                "CSV-Zeile": csv_line,
+                "TradeID": trade_id,
+                "Symbol": symbol,
+                "Kontrakt laut Symbol": source_contract,
+                "PNL_Ticks": float(ticks),
+                "PNL_Currency_Source": float(source_pnl),
+                "Erwartet laut Symbol": 0.0,
+                "Implizit $/Tick": pd.NA,
+                "Abweichung $": float(source_pnl),
+                "Diagnose": "Dollar-P/L ungleich 0 bei PNL_Ticks = 0.",
+                "Dashboard MES P/L": float(source_pnl) if source_contract == "UNKNOWN" else 0.0,
+                "Dashboard ES P/L": float(source_pnl) if source_contract == "UNKNOWN" else 0.0,
+                "Dashboard-Korrektur": "FALLBACK – PNL_Ticks ist 0; Quellwert bleibt nur in diesem Sonderfall Basis",
+            }
+            pnl_rows.append(pnl_row)
+            add_issue("FEHLER", "P/L-Plausibilität", sim, str(csv_line), trade_id, symbol, dt, pnl_row["Diagnose"])
+            continue
+
+        if float(ticks) == 0.0 or expected_tick is None:
+            continue
+
+        expected_pnl = float(ticks) * float(expected_tick)
+        diff = float(source_pnl) - expected_pnl
+        implied_tick = abs(float(source_pnl) / float(ticks))
+        rel_error = abs(implied_tick - float(expected_tick)) / float(expected_tick)
+
+        # Require both a material tick-value discrepancy and a material dollar
+        # difference. This avoids treating small fixed fees/rounding deltas as a
+        # 10x contract-basis error.
+        severe_abs_threshold = max(2.0, 2.0 * float(expected_tick))
+        if rel_error > 0.20 and abs(diff) >= severe_abs_threshold:
+            severity = "FEHLER"
+            diagnosis = (
+                f"{source_contract}-Symbol erwartet {expected_tick:.2f} $/Tick, "
+                f"der Export impliziert {implied_tick:.2f} $/Tick."
+            )
+        elif abs(diff) > 0.01:
+            severity = "WARNUNG"
+            diagnosis = (
+                f"Kleine Dollarabweichung zur {source_contract}-Tickbasis ({diff:+.2f} $). "
+                "Mögliche Gebühr/Rundung oder Quellkorrektur."
+            )
+        else:
+            continue
+
+        pnl_row = {
+            "Schweregrad": severity,
+            "Sim / Account": sim,
+            "CSV-Zeile": csv_line,
+            "TradeID": trade_id,
+            "Symbol": symbol,
+            "Kontrakt laut Symbol": source_contract,
+            "PNL_Ticks": float(ticks),
+            "PNL_Currency_Source": float(source_pnl),
+            "Erwartet laut Symbol": expected_pnl,
+            "Implizit $/Tick": implied_tick,
+            "Abweichung $": diff,
+            "Diagnose": diagnosis,
+            "Dashboard MES P/L": float(ticks) * CONTRACT_TICK_VALUES["MES"],
+            "Dashboard ES P/L": float(ticks) * CONTRACT_TICK_VALUES["ES"],
+            "Dashboard-Korrektur": "AUTO-KORRIGIERT – Source-Dollarwert wird nicht für Performance verwendet; PNL_Ticks × gewählte Tickbasis",
+        }
+        pnl_rows.append(pnl_row)
+        add_issue(severity, "P/L-Plausibilität", sim, str(csv_line), trade_id, symbol, dt, diagnosis)
+
+    # ------------------------------------------------------------------
+    # 4) Structural / parse checks
+    # ------------------------------------------------------------------
+    for _, row in df.iterrows():
+        sim = account_label(row["_Account"])
+        line = int(row["CSVLine"])
+        trade_id = clean_label(row["_TradeID"], "")
+        symbol = clean_label(row["_Symbol"], "")
+        dt = clean_label(row.get("DateTime", ""), "")
+        problems = []
+
+        if row["_Account"] == "":
+            problems.append("TradeAccount/Sim fehlt")
+        if row["_TradeID"] == "":
+            problems.append("TradeID fehlt")
+        if row["_Symbol"] == "":
+            problems.append("Symbol fehlt")
+        elif detect_contract_from_symbol(row["_Symbol"]) == "UNKNOWN":
+            problems.append("Symbol kann nicht als ES/MES erkannt werden")
+        if pd.isna(row["_DateTimeParsed"]):
+            problems.append("DateTime ungültig/leer")
+        if row["_RowType"] not in entry_types + exit_types:
+            problems.append(f"Unbekannter RowType: {clean_label(row['_RowType'], 'leer')}")
+
+        if problems:
+            detail = "; ".join(problems)
+            structural_rows.append({
+                "Sim / Account": sim,
+                "CSV-Zeile": line,
+                "RowType": clean_label(row["_RowType"], "–"),
+                "TradeID": trade_id,
+                "Symbol": symbol,
+                "DateTime": dt,
+                "Fehler": detail,
+            })
+            add_issue("FEHLER", "Struktur / Format", sim, str(line), trade_id, symbol, dt, detail)
+
+    duplicate_entries_df = pd.DataFrame(duplicate_entry_rows)
+    duplicate_exits_df = pd.DataFrame(duplicate_exit_rows)
+    pnl_df = pd.DataFrame(pnl_rows)
+    missing_exits_df = pd.DataFrame(missing_exit_rows)
+    missing_entries_df = pd.DataFrame(missing_entry_rows)
+    structural_df = pd.DataFrame(structural_rows)
+    issues_df = pd.DataFrame(issue_rows)
+
+    # ------------------------------------------------------------------
+    # Dashboard correction ledger. Source errors remain visible, but known
+    # failure modes are prevented from corrupting dashboard performance.
+    # ------------------------------------------------------------------
+    if not issues_df.empty:
+        def correction_for_issue(row: pd.Series) -> pd.Series:
+            category = clean_label(row.get("Kategorie", ""), "")
+            severity = clean_label(row.get("Schweregrad", ""), "")
+            if category == "Mehrfach-EXIT (zulässig)":
+                return pd.Series({
+                    "Korrekturstatus": "KEINE KORREKTUR NÖTIG",
+                    "Dashboard-Maßnahme": "Nur Info. Alle EXIT-Zeilen bleiben als eigenständige Closed Trades in Tradezahl, P/L, PF, Equity und Drawdown enthalten.",
+                    "Quellfix erforderlich": "NEIN",
+                })
+            if category == "P/L-Plausibilität":
+                return pd.Series({
+                    "Korrekturstatus": "AUTO-KORRIGIERT",
+                    "Dashboard-Maßnahme": "PNL_Currency_Source bleibt Auditwert; Performance wird aus PNL_Ticks × gewählter ES/MES-Tickbasis berechnet.",
+                    "Quellfix erforderlich": "JA" if severity == "FEHLER" else "PRÜFEN",
+                })
+            if category == "ENTRY ohne EXIT":
+                return pd.Series({
+                    "Korrekturstatus": "SICHER BEHANDELT",
+                    "Dashboard-Maßnahme": "ENTRY wird nicht als geschlossener Trade/P&L gewertet. Es wird kein EXIT oder Gewinn/Verlust erfunden.",
+                    "Quellfix erforderlich": "JA",
+                })
+            if category == "EXIT ohne ENTRY":
+                return pd.Series({
+                    "Korrekturstatus": "SICHER BEHANDELT",
+                    "Dashboard-Maßnahme": "Closed EXIT bleibt anhand PNL_Ticks im P/L; Session nutzt SignalDateTime und danach Exit-DateTime als Fallback.",
+                    "Quellfix erforderlich": "JA",
+                })
+            if category == "Struktur / Format":
+                return pd.Series({
+                    "Korrekturstatus": "SICHER BEHANDELT",
+                    "Dashboard-Maßnahme": "Fehlende Daten werden nicht erfunden; verfügbare Felder/Fallbacks werden genutzt, nicht verwertbare Zeilen fließen nicht falsch ein.",
+                    "Quellfix erforderlich": "JA",
+                })
+            if category == "Mehrfach-ENTRY (zulässig)":
+                return pd.Series({
+                    "Korrekturstatus": "KEINE KORREKTUR NÖTIG",
+                    "Dashboard-Maßnahme": "Nur Info. Multi-Limit/Multi-Entry bleibt vollständig erhalten.",
+                    "Quellfix erforderlich": "NEIN",
+                })
+            return pd.Series({
+                "Korrekturstatus": "GEPRÜFT",
+                "Dashboard-Maßnahme": "Auffälligkeit wird angezeigt; keine unsichere automatische Veränderung.",
+                "Quellfix erforderlich": "PRÜFEN",
+            })
+
+        corrections = issues_df.apply(correction_for_issue, axis=1)
+        issues_df = pd.concat([issues_df, corrections], axis=1)
+
+    # ------------------------------------------------------------------
+    # 5) Per-Sim control summary. Include clean Sims as explicit OK rows.
+    # ------------------------------------------------------------------
+    all_accounts = sorted(
+        {account_label(x) for x in df["_Account"].tolist()},
+        key=natural_algo_sort_key,
+    )
+    summary_rows = []
+    for sim in all_accounts:
+        dup_entry_groups = int((duplicate_entries_df.get("Sim / Account", pd.Series(dtype=str)) == sim).sum()) if not duplicate_entries_df.empty else 0
+        dup_exit_groups = int((duplicate_exits_df.get("Sim / Account", pd.Series(dtype=str)) == sim).sum()) if not duplicate_exits_df.empty else 0
+        pnl_errors = int(((pnl_df.get("Sim / Account", pd.Series(dtype=str)) == sim) & (pnl_df.get("Schweregrad", pd.Series(dtype=str)) == "FEHLER")).sum()) if not pnl_df.empty else 0
+        pnl_warnings = int(((pnl_df.get("Sim / Account", pd.Series(dtype=str)) == sim) & (pnl_df.get("Schweregrad", pd.Series(dtype=str)) == "WARNUNG")).sum()) if not pnl_df.empty else 0
+        entry_no_exit = int((missing_exits_df.get("Sim / Account", pd.Series(dtype=str)) == sim).sum()) if not missing_exits_df.empty else 0
+        exit_no_entry = int((missing_entries_df.get("Sim / Account", pd.Series(dtype=str)) == sim).sum()) if not missing_entries_df.empty else 0
+        struct = int((structural_df.get("Sim / Account", pd.Series(dtype=str)) == sim).sum()) if not structural_df.empty else 0
+
+        # Mehrfach-ENTRY ist in diesem Sierra-Setup zulässig (z. B. mehrere Limits
+        # am selben Level) und darf den Qualitätsstatus NICHT verschlechtern.
+        # Mehrfach-ENTRY und Mehrfach-EXIT sind in diesem Multi-Limit-Setup
+        # zulässig und beeinflussen den Data-Quality-Status nicht.
+        hard = pnl_errors + entry_no_exit + exit_no_entry + struct
+        if hard > 0:
+            status = "FEHLER"
+        elif pnl_warnings > 0:
+            status = "WARNUNG"
+        else:
+            status = "OK"
+
+        if hard == 0 and pnl_warnings == 0:
+            dashboard_status = "OK"
+        elif entry_no_exit + exit_no_entry + struct > 0:
+            dashboard_status = "SICHER BEHANDELT"
+        else:
+            dashboard_status = "AUTO-KORRIGIERT"
+
+        summary_rows.append({
+            "Sim / Account": sim,
+            "Quellstatus": status,
+            "Dashboard-Status": dashboard_status,
+            "Mehrfach-ENTRY (Info)": dup_entry_groups,
+            "Mehrfach-EXIT (Info)": dup_exit_groups,
+            "P/L Fehler": pnl_errors,
+            "P/L Warnungen": pnl_warnings,
+            "ENTRY ohne EXIT": entry_no_exit,
+            "EXIT ohne ENTRY": exit_no_entry,
+            "Strukturfehler": struct,
+            "Fehler gesamt": hard,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    dup_entry_extra = int((duplicate_entries_df["Anzahl"] - 1).sum()) if not duplicate_entries_df.empty else 0
+    dup_exit_extra = int((duplicate_exits_df["Anzahl"] - 1).sum()) if not duplicate_exits_df.empty else 0
+    pnl_errors_total = int((pnl_df["Schweregrad"] == "FEHLER").sum()) if not pnl_df.empty else 0
+    pnl_warnings_total = int((pnl_df["Schweregrad"] == "WARNUNG").sum()) if not pnl_df.empty else 0
+    structural_total = int(len(structural_df))
+
+    # Multiple ENTRY rows are informational only. They can represent valid
+    # multi-limit / multi-entry execution and therefore are excluded from the
+    # hard Data Quality error count.
+    # Repeated-looking ENTRY/EXIT groups are informational only and can be
+    # legitimate multi-limit executions. They are excluded from hard errors.
+    hard_total = (
+        pnl_errors_total
+        + len(missing_exits_df) + len(missing_entries_df) + structural_total
+    )
+    if hard_total > 0:
+        status = "FEHLER"
+    elif pnl_warnings_total > 0:
+        status = "WARNUNG"
+    else:
+        status = "OK"
+
+    # Only actual P/L source inconsistencies are auto-corrected here.
+    # Multi-ENTRY / Multi-EXIT rows are never removed or altered.
+    auto_corrected = int(len(pnl_df))
+    safely_handled = int(len(missing_exits_df) + len(missing_entries_df) + structural_total)
+    dashboard_status = "OK" if (auto_corrected + safely_handled) == 0 else (
+        "BEREINIGT" if safely_handled == 0 else "BEREINIGT / QUELLFIX NÖTIG"
+    )
+
+    metrics = {
+        "source_rows": int(len(df)),
+        "entries": int(len(entries)),
+        "exits": int(len(exits)),
+        "duplicate_entry_groups": int(len(duplicate_entries_df)),
+        "duplicate_entry_extra_rows": dup_entry_extra,
+        "duplicate_exit_groups": int(len(duplicate_exits_df)),
+        "duplicate_exit_extra_rows": dup_exit_extra,
+        "pnl_errors": pnl_errors_total,
+        "pnl_warnings": pnl_warnings_total,
+        "missing_exit": int(len(missing_exits_df)),
+        "missing_entry": int(len(missing_entries_df)),
+        "structural_errors": structural_total,
+        "status": status,
+        "dashboard_status": dashboard_status,
+        "auto_corrected": auto_corrected,
+        "safely_handled": safely_handled,
+    }
+
+    return {
+        "summary": summary_df,
+        "issues": issues_df,
+        "duplicate_entries": duplicate_entries_df,
+        "duplicate_exits": duplicate_exits_df,
+        "pnl_checks": pnl_df,
+        "missing_exits": missing_exits_df,
+        "missing_entries": missing_entries_df,
+        "structural": structural_df,
+        "metrics": metrics,
+    }
+
+
+def style_quality_summary(df: pd.DataFrame):
+    if df.empty:
+        return df
+    styled = df.style
+    if "Quellstatus" in df.columns:
+        styled = styled.map(
+            lambda v: (
+                f"color: {NEGATIVE}; font-weight: 700" if v == "FEHLER"
+                else (f"color: {WARNING}; font-weight: 700" if v == "WARNUNG"
+                      else f"color: {POSITIVE}; font-weight: 700")
+            ),
+            subset=["Quellstatus"],
+        )
+    if "Dashboard-Status" in df.columns:
+        styled = styled.map(
+            lambda v: f"color: {POSITIVE}; font-weight: 700" if v in {"OK", "AUTO-KORRIGIERT", "SICHER BEHANDELT"} else "",
+            subset=["Dashboard-Status"],
+        )
+    return styled
+
+
+def style_pnl_quality_table(df: pd.DataFrame):
+    if df.empty:
+        return df
+    formatters = {
+        "PNL_Ticks": lambda x: _quality_float(x, 2),
+        "PNL_Currency_Source": _quality_money,
+        "Erwartet laut Symbol": _quality_money,
+        "Implizit $/Tick": lambda x: _quality_float(x, 2),
+        "Abweichung $": _quality_money,
+        "Dashboard MES P/L": _quality_money,
+        "Dashboard ES P/L": _quality_money,
+    }
+    styled = df.style.format({k: v for k, v in formatters.items() if k in df.columns})
+    if "Schweregrad" in df.columns:
+        styled = styled.map(
+            lambda v: f"color: {NEGATIVE}; font-weight: 700" if v == "FEHLER"
+            else (f"color: {WARNING}; font-weight: 700" if v == "WARNUNG" else ""),
+            subset=["Schweregrad"],
+        )
+    return styled
+
+
+def data_quality_tab(raw_df: pd.DataFrame) -> None:
+    report = build_data_quality_report(raw_df)
+    metrics = report["metrics"]
+
+    st.markdown('<div class="wt-section-title">Data Quality & Auto-Correction · BlueBlack</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Die Prüfung läuft direkt auf der Quelldatei vor Bereinigung und Performance-Berechnung. '
+        'CSV-Zeile 1 ist die Kopfzeile; Datenzeilen beginnen bei Zeile 2. Mehrere ENTRY- und EXIT-Zeilen können bei Multi-Limit-/Multi-Entry-Setups '
+        'korrekt sein und werden deshalb nur als INFO gezeigt. Sie werden nicht automatisch entfernt und beeinflussen den Qualitätsstatus nicht.</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    status = metrics.get("status", "NO DATA")
+    c1.metric("Quellstatus", status)
+    c2.metric("Dashboard", metrics.get("dashboard_status", "–"))
+    c3.metric("Auto-korrigiert", metrics.get("auto_corrected", 0), help="Automatisch korrigierte P/L-Quellabweichungen. Mehrfach-ENTRY/EXIT werden nicht verändert.")
+    c4.metric("Mehrfach-EXIT", f"{metrics.get('duplicate_exit_groups', 0)} Gruppen", delta=f"{metrics.get('duplicate_exit_extra_rows', 0)} zusätzliche Zeilen", delta_color="off", help="Nur Info: mögliche legitime Multi-Limit-Ausführungen; keine Zeile wird entfernt.")
+    c5.metric("P/L Quellfehler", metrics.get("pnl_errors", 0))
+    c6.metric("Quellfix/Fallback", metrics.get("safely_handled", 0))
+
+    if status == "OK":
+        st.success("Keine der aktuell geprüften Dateninkonsistenzen wurde gefunden.")
+    elif status == "WARNUNG":
+        st.warning("Keine harten Datenfehler erkannt, aber mindestens eine Quellwarnung sollte geprüft werden.")
+    else:
+        st.error(
+            "Die BlueBlack-QUELLE enthält Fehler/Auffälligkeiten. Das Dashboard schützt seine Berechnung davor: "
+            "P/L-Abweichungen werden aus PNL_Ticks neu bewertet. Mehrfach-ENTRYs und Mehrfach-EXITs bleiben vollständig erhalten, "
+            "weil sie legitime Multi-Limit-Ausführungen sein können. Nicht rekonstruierbare Quelldaten werden nicht erfunden und bleiben als Quellfix sichtbar."
+        )
+
+    st.markdown('<div class="wt-section-title">Fehlerübersicht nach Sim</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Hier siehst du sofort, welches Sim betroffen ist und welche Fehlerart dort vorkommt. '
+        'Mehrfach-ENTRY und Mehrfach-EXIT werden als Info mitgezählt, beeinflussen den Status aber nicht. '
+        'Sims ohne harte Treffer bleiben bewusst mit Status OK sichtbar.</div>',
+        unsafe_allow_html=True,
+    )
+    summary = report["summary"]
+    if summary.empty:
+        st.info("Keine Sim-/Account-Daten gefunden.")
+    else:
+        st.dataframe(style_quality_summary(summary), use_container_width=True, hide_index=True, height=min(560, 80 + 38 * len(summary)))
+
+    st.markdown('<div class="wt-section-title">Dashboard-Korrekturprotokoll</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Jeder erkannte Punkt zeigt nicht nur den Quellfehler, sondern auch exakt, wie das Dashboard ihn behandelt. '
+        'Die BlueBlack-Datei selbst wird niemals stillschweigend verändert.</div>',
+        unsafe_allow_html=True,
+    )
+    issues = report["issues"]
+    if issues.empty:
+        st.success("Keine Korrekturen nötig.")
+    else:
+        ledger_cols = [c for c in [
+            "Schweregrad", "Kategorie", "Sim / Account", "CSV-Zeile(n)", "TradeID", "Symbol",
+            "Korrekturstatus", "Dashboard-Maßnahme", "Quellfix erforderlich", "Details"
+        ] if c in issues.columns]
+        st.dataframe(issues[ledger_cols], use_container_width=True, hide_index=True, height=min(760, 110 + 34 * len(issues)))
+
+    st.markdown('<div class="wt-section-title">Alle Auffälligkeiten mit CSV-Zeile</div>', unsafe_allow_html=True)
+    if issues.empty:
+        st.success("Keine Auffälligkeiten.")
+    else:
+        severity_order = {"FEHLER": 0, "WARNUNG": 1, "INFO": 2}
+        issue_view = issues.copy()
+        issue_view["_order"] = issue_view["Schweregrad"].map(severity_order).fillna(9)
+        issue_view = issue_view.sort_values(["_order", "Sim / Account", "Kategorie", "CSV-Zeile(n)"]).drop(columns="_order")
+        st.dataframe(issue_view, use_container_width=True, hide_index=True, height=min(700, 100 + 34 * len(issue_view)))
+
+    st.markdown('<div class="wt-section-title">Multi-Limit / Mehrfach-Trade-Struktur</div>', unsafe_allow_html=True)
+    d1, d2 = st.columns(2, gap="large")
+    with d1:
+        st.markdown("**Mehrfach-ENTRY (Info · zulässig)**")
+        st.caption(
+            "Mehrere ENTRY-Zeilen mit gleichen Kernfeldern sind nicht automatisch ein Fehler. "
+            "In deinem Setup können mehrere Limits am selben Level liegen bzw. gefüllt werden. "
+            "Die Tabelle dient nur der Nachvollziehbarkeit."
+        )
+        dup_entry = report["duplicate_entries"]
+        if dup_entry.empty:
+            st.success("Keine Mehrfach-ENTRY-Gruppen erkannt.")
+        else:
+            st.dataframe(dup_entry, use_container_width=True, hide_index=True, height=min(420, 90 + 38 * len(dup_entry)))
+    with d2:
+        st.markdown("**Mehrfach-EXIT (Info · zulässig)**")
+        st.caption(
+            "Gleich aussehende EXIT-Zeilen sind kein Fehler. Zwei oder mehr Limit-Orders können am selben Level "
+            "eingestiegen und später mit identischen Exitdaten geschlossen werden. Alle EXIT-Zeilen bleiben erhalten."
+        )
+        dup_exit = report["duplicate_exits"]
+        if dup_exit.empty:
+            st.success("Keine Mehrfach-EXIT-Gruppen mit gleichen Kernfeldern erkannt.")
+        else:
+            st.dataframe(dup_exit, use_container_width=True, hide_index=True, height=min(420, 90 + 38 * len(dup_exit)))
+
+    st.markdown('<div class="wt-section-title">P/L-Plausibilität je Quellzeile</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="wt-section-sub">Vergleich von PNL_Ticks und dem exportierten PNL_Currency mit der Tickbasis des Symbols. '
+        'Beispiel: MES +7 Ticks müssen 8,75 $ entsprechen; 87,50 $ implizieren stattdessen 12,50 $/Tick und werden als Fehler markiert. '
+        'Kleine Restabweichungen werden separat als Warnung ausgewiesen. In den Performance-KPIs wird der Quell-Dollarwert bei vorhandenen '
+        'PNL_Ticks automatisch durch die kanonische Tick-Berechnung ersetzt; beide Werte bleiben im Audit sichtbar.</div>',
+        unsafe_allow_html=True,
+    )
+    pnl_checks = report["pnl_checks"]
+    if pnl_checks.empty:
+        st.success("Keine P/L-Plausibilitätsabweichungen.")
+    else:
+        st.dataframe(
+            style_pnl_quality_table(pnl_checks),
+            use_container_width=True,
+            hide_index=True,
+            height=min(760, 110 + 34 * len(pnl_checks)),
+        )
+
+    st.markdown('<div class="wt-section-title">ENTRY / EXIT Vollständigkeit</div>', unsafe_allow_html=True)
+    p1, p2 = st.columns(2, gap="large")
+    with p1:
+        st.markdown("**ENTRY vorhanden, EXIT fehlt**")
+        miss_exit = report["missing_exits"]
+        if miss_exit.empty:
+            st.success("Keine fehlenden EXITs erkannt.")
+        else:
+            st.dataframe(miss_exit, use_container_width=True, hide_index=True, height=min(420, 90 + 38 * len(miss_exit)))
+    with p2:
+        st.markdown("**EXIT vorhanden, ENTRY fehlt**")
+        miss_entry = report["missing_entries"]
+        if miss_entry.empty:
+            st.success("Keine EXITs ohne passende ENTRY-Zeile erkannt.")
+        else:
+            st.dataframe(miss_entry, use_container_width=True, hide_index=True, height=min(420, 90 + 38 * len(miss_entry)))
+
+    st.markdown('<div class="wt-section-title">Struktur- und Formatfehler</div>', unsafe_allow_html=True)
+    structural = report["structural"]
+    if structural.empty:
+        st.success("Keine fehlenden Kernfelder, ungültigen DateTimes oder unbekannten ES/MES-Symbole erkannt.")
+    else:
+        st.dataframe(structural, use_container_width=True, hide_index=True, height=min(520, 90 + 38 * len(structural)))
+
+    # Downloadable audit report for fixing the exporter/source file.
+    if not issues.empty:
+        audit_csv = issues.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Data-Quality-Fehlerliste als CSV herunterladen",
+            audit_csv,
+            file_name="WT_Data_Quality_Audit.csv",
+            mime="text/csv",
+            key="download_data_quality_audit",
+        )
+
+
+
+def system_tab(raw_df: pd.DataFrame, trades: pd.DataFrame, filtered: pd.DataFrame, info: Dict[str, Any], session_view: str = DEFAULT_SESSION_VIEW) -> None:
     st.markdown('<div class="wt-section-title">Data & System Status</div>', unsafe_allow_html=True)
     source_status(info, raw_df, trades)
 
@@ -1406,18 +2466,71 @@ Damit erscheinen neue Sim-/Algo-Accounts automatisch und entfernte Accounts vers
 """
     )
 
+
+    st.markdown('<div class="wt-section-title">Session-Zuordnung</div>', unsafe_allow_html=True)
+    session_counts = trades.get("TradeSession", pd.Series(dtype=str)).value_counts().to_dict() if not trades.empty else {}
+    st.markdown(
+        f"""
+Aktive Session-Ansicht: **{session_view}**. Standard beim Start ist **Globex**.
+
+- **Globex** = RTH + ETH (keine Trades werden aufgrund der Session ausgeschlossen).
+- **RTH** = tatsächlicher Trade-Entry von **08:30 bis vor 15:00 CT**.
+- **ETH** = alle übrigen gültigen Globex-Zeiten außerhalb dieses RTH-Fensters.
+- Für die Zuordnung wird primär der tatsächliche `EntryDateTime` aus der passenden ENTRY-Zeile verwendet. Falls dieser fehlt, folgen `SignalDateTime` und zuletzt `DateTime`.
+- Falls ein zukünftiger Export explizit `RTH` oder `ETH` liefert, hat diese Quellangabe Vorrang.
+
+Erkannt: **RTH {int(session_counts.get('RTH', 0))} · ETH {int(session_counts.get('ETH', 0))} · UNKNOWN {int(session_counts.get('UNKNOWN', 0))}**.
+"""
+    )
+
+    st.markdown('<div class="wt-section-title">P/L Normalisierung ES / MES</div>', unsafe_allow_html=True)
+    display_contract = DEFAULT_DISPLAY_CONTRACT
+    if not trades.empty and "DisplayContract" in trades.columns:
+        display_contract = clean_label(trades["DisplayContract"].iloc[0], DEFAULT_DISPLAY_CONTRACT).upper()
+    tick_value = CONTRACT_TICK_VALUES.get(display_contract, CONTRACT_TICK_VALUES[DEFAULT_DISPLAY_CONTRACT])
+    source_counts = trades.get("SourceContract", pd.Series(dtype=str)).value_counts().to_dict() if not trades.empty else {}
+    st.markdown(
+        f"""
+Aktuelle Anzeige-Basis: **{display_contract} = {num(tick_value, 2)} $ pro Tick**. Standard beim Start ist **ES**.
+
+- **PNL_Ticks ist die verbindliche Berechnungsbasis** für die Performance-Anzeige.
+- MES-Darstellung = `PNL_Ticks × 1,25 $`.
+- ES-Darstellung = `PNL_Ticks × 12,50 $`.
+- Dadurch können gemischte oder falsch monetarisierte Quellzeilen die Portfolio-Kennzahlen nicht mehr verfälschen.
+- Das ursprünglich exportierte Dollar-P/L bleibt unverändert in `PNL_Currency_Source`.
+- `ExportTickValue` und `PNL_Adjustment_Source` dienen nur dem Audit der Quelldatei und werden **nicht** in das standardisierte Dashboard-P/L eingerechnet.
+- Mehrere gleich aussehende ENTRY- oder EXIT-Zeilen werden **nicht** automatisch entfernt. Sie können echte Multi-Limit-/Multi-Entry-Trades sein und bleiben vollständig in den Kennzahlen enthalten.
+
+Erkannte Quellkontrakte: **ES {int(source_counts.get('ES', 0))} · MES {int(source_counts.get('MES', 0))} · UNKNOWN {int(source_counts.get('UNKNOWN', 0))}**.
+"""
+    )
+
     st.markdown('<div class="wt-section-title">Datenintegrität</div>', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Closed Trades gesamt", len(trades))
-    c2.metric("Algos erkannt", trades["Algo"].nunique() if not trades.empty else 0)
-    c3.metric("Accounts", trades["TradeAccount"].nunique() if not trades.empty else 0)
-    c4.metric("Gefilterte Trades", len(filtered))
+    session_counts = trades.get("TradeSession", pd.Series(dtype=str)).value_counts().to_dict() if not trades.empty else {}
+
+    source_exit_rows = 0
+    if not raw_df.empty and "RowType" in raw_df.columns:
+        source_types = raw_df["RowType"].astype(str).str.upper().str.strip()
+        source_exit_rows = int(source_types.isin(["EXIT", "CLOSE", "CLOSED", "TRADE_EXIT", "E"]).sum())
+    elif not raw_df.empty:
+        source_exit_rows = len(raw_df)
+    rows_removed = max(0, int(source_exit_rows - len(trades)))
+
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Closed EXIT Trades", len(trades))
+    c2.metric("EXIT-Zeilen entfernt", rows_removed, help="Soll 0 sein: gleich aussehende Multi-Limit-Trades werden nicht automatisch entfernt.")
+    c3.metric("RTH Trades", int(session_counts.get("RTH", 0)))
+    c4.metric("ETH Trades", int(session_counts.get("ETH", 0)))
+    c5.metric("Algos erkannt", trades["Algo"].nunique() if not trades.empty else 0)
+    c6.metric("Accounts", trades["TradeAccount"].nunique() if not trades.empty else 0)
+    c7.metric("Gefilterte Trades", len(filtered))
 
     missing_dt = int(trades["DateTime"].isna().sum()) if not trades.empty else 0
     unknown_algo = int((trades["Algo"] == "Unbekannter Algo").sum()) if not trades.empty else 0
     blank_notes = int((trades["Notes"].astype(str).str.strip() == "").sum()) if not trades.empty else 0
     quality = pd.DataFrame(
         [
+            ["EXIT-Zeilen automatisch entfernt", rows_removed],
             ["Ungültige DateTime", missing_dt],
             ["Unbekannter Algo", unknown_algo],
             ["Closed Trades ohne Notes", blank_notes],
@@ -1450,6 +2563,37 @@ def main() -> None:
             height=0,
         )
 
+    display_contract = st.sidebar.selectbox(
+        "P/L Darstellung",
+        ["ES", "MES"],
+        index=0,
+        format_func=lambda x: f"{x} · {num(CONTRACT_TICK_VALUES[x], 2)} $/Tick",
+        help=(
+            "Standard ist ES. Das Dashboard normalisiert alle realisierten Dollar-P/L-Werte auf die gewählte "
+            "Tick-Basis. MES = 1,25 $/Tick, ES = 12,50 $/Tick."
+        ),
+        key="display_contract_basis",
+    )
+    st.sidebar.caption(
+        f"Aktive P/L-Basis: {display_contract} · {num(CONTRACT_TICK_VALUES[display_contract], 2)} $ pro Tick"
+    )
+
+    session_view = st.sidebar.selectbox(
+        "Session",
+        SESSION_CHOICES,
+        index=0,
+        format_func=lambda x: "Globex · RTH + ETH" if x == "Globex" else x,
+        help=(
+            "Standard ist Globex und zeigt RTH + ETH zusammen. "
+            "RTH = tatsächlicher Entry 08:30 bis vor 15:00 CT. "
+            "ETH = alle übrigen Globex-Zeiten außerhalb des RTH-Fensters."
+        ),
+        key="session_view_filter",
+    )
+    st.sidebar.caption(
+        "Aktive Session: Globex (RTH + ETH)" if session_view == "Globex" else f"Aktive Session: {session_view}"
+    )
+
     try:
         raw_df, info, _ = load_data()
     except Exception as exc:
@@ -1457,8 +2601,8 @@ def main() -> None:
         st.info("Prüfe GitHub-Secrets, Repo-Name, Branch, data_path und ob das Upload-Script läuft.")
         st.stop()
 
-    trades = prepare_trades(raw_df)
-    show_header(trades, info)
+    trades = prepare_trades(raw_df, display_contract)
+    show_header(trades, info, session_view)
 
     if raw_df.empty:
         st.warning("CSV ist noch leer. Sobald geschlossene Trades synchronisiert sind, erscheinen die Auswertungen hier.")
@@ -1470,15 +2614,19 @@ def main() -> None:
         st.dataframe(raw_df, use_container_width=True)
         st.stop()
 
-    filtered, risk_limit_ticks = sidebar_filters(trades)
+    filtered, risk_limit_ticks = sidebar_filters(trades, session_view)
     summary = calc_summary(filtered)
 
     if filtered.empty:
-        st.warning("Die aktuelle Filterkombination enthält keine geschlossenen Trades.")
+        st.warning(
+            "Die aktuelle Filterkombination enthält keine geschlossenen Trades. "
+            "Die Session-Umschaltung selbst ist aktiv; prüfe ggf. bewusst gesetzte Algo-, Zeitraum- oder technische Filter."
+        )
         st.stop()
 
     show_hero(summary, filtered)
     show_kpis(summary)
+    show_data_quality_banner(raw_df)
 
     tabs = st.tabs([
         "Executive",
@@ -1486,6 +2634,7 @@ def main() -> None:
         "Performance",
         "Risk & Qualität",
         "Trades & Audit",
+        "Data Quality & Korrektur",
         "Data / System",
     ])
 
@@ -1500,16 +2649,23 @@ def main() -> None:
     with tabs[4]:
         trades_tab(filtered)
     with tabs[5]:
-        system_tab(raw_df, trades, filtered, info)
+        data_quality_tab(raw_df)
+    with tabs[6]:
+        system_tab(raw_df, trades, filtered, info, session_view)
 
     mode = execution_mode(filtered)
     st.markdown(
         f"""
         <div class="wt-disclosure">
-          <strong>Performance disclosure:</strong> Angezeigt wird ausschließlich realisiertes P/L aus importierten geschlossenen Trades.
-          Gebühren, Slippage, Funding, Abgaben oder andere Kosten sind nur enthalten, wenn sie bereits in <code>PNL_Currency</code> des Exports enthalten sind.
-          Die aktuelle Datenmenge ist als <strong>{html.escape(mode)}</strong> erkannt. Simulations-/Backtest-Ergebnisse sind keine Garantie für zukünftige Ergebnisse.
-          Dashboard v{APP_VERSION}.
+          <strong>Performance disclosure:</strong> Angezeigt wird ausschließlich realisiertes P/L aus importierten geschlossenen Trades,
+          normalisiert auf <strong>{html.escape(display_contract)} · {num(CONTRACT_TICK_VALUES[display_contract], 2)} $/Tick</strong>.
+          Die Performance wird verbindlich aus <code>PNL_Ticks × gewähltem Tickwert</code> berechnet.
+          Original-Dollarwerte bleiben im Audit als <code>PNL_Currency_Source</code> erhalten; <code>PNL_Adjustment_Source</code> ist ausschließlich ein Quellen-Auditfeld
+          und verändert die standardisierte Performance nicht. Gleich aussehende ENTRY-/EXIT-Zeilen werden nicht automatisch dedupliziert,
+          weil sie legitime Multi-Limit-/Multi-Entry-Ausführungen darstellen können.
+          Aktive Session: <strong>{html.escape(session_view)}</strong> (Globex = RTH + ETH; RTH 08:30–15:00 CT).
+          Die aktuelle Datenmenge ist als <strong>{html.escape(mode)}</strong> erkannt.
+          Simulations-/Backtest-Ergebnisse sind keine Garantie für zukünftige Ergebnisse. Dashboard v{APP_VERSION}.
         </div>
         """,
         unsafe_allow_html=True,
