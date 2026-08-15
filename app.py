@@ -37,7 +37,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.15"
+APP_VERSION = "2.0.16"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -1697,9 +1697,151 @@ def require_trades_audit_access() -> bool:
 def trades_tab(filtered: pd.DataFrame) -> None:
     if not require_trades_audit_access():
         return
+
     st.markdown('<div class="wt-section-title">Trade Audit Trail</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="wt-section-sub">Nur geschlossene Trades. Technische Detailfelder bleiben für Nachvollziehbarkeit und Export erhalten.</div>',
+        '<div class="wt-section-sub">Nur geschlossene Trades. Zusätzlich werden Originalwerte vor der Dashboard-Korrektur '
+        'und die tatsächlich verwendeten Werte nach der Korrektur getrennt dargestellt.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Tabelle 1: dieselben gefilterten Closed Trades mit den unveränderten
+    # Dollar-P/L-Werten aus der BlueBlack-Quelldatei.
+    # ------------------------------------------------------------------
+    source_view = filtered.copy()
+    source_view["PNL vor Korrektur"] = pd.to_numeric(
+        source_view.get("PNL_Currency_Source", 0.0), errors="coerce"
+    ).fillna(0.0)
+
+    source_cols = [
+        "CSVLine", "EntryCSVLine", "DateTime", "EntryDateTime", "SessionDateTime",
+        "TradeSession", "TradeID", "Algo", "AlgoVersion", "Module", "TradeAccount",
+        "Symbol", "CountColor", "Direction", "EntryFillPrice", "ExitPrice",
+        "StopPrice", "TargetPrice", "RiskTicks", "RewardTicks", "Quantity",
+        "PNL_Ticks", "PNL vor Korrektur", "MAE_Ticks", "MFE_Ticks",
+        "ExitReason", "Notes",
+    ]
+    source_cols = [c for c in source_cols if c in source_view.columns]
+
+    st.markdown(
+        '<div class="wt-section-title">Alle Trades · Originalwerte ohne Dashboard-Korrektur</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Diese Tabelle zeigt das Dollar-P/L so, wie es in der BlueBlack-Quelle exportiert wurde. '
+        'Es findet in dieser Ansicht keine ES/MES-P/L-Korrektur statt.</div>',
+        unsafe_allow_html=True,
+    )
+    st.dataframe(
+        source_view[source_cols].sort_values("DateTime", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
+
+    # ------------------------------------------------------------------
+    # Tabelle 2: vor/nach Korrektur. Die Performance-Basis des Dashboards
+    # bleibt unverändert: PNL_Ticks × gewählte ES/MES-Tickbasis.
+    # Nur tatsächlich veränderte Zeilen werden farblich hervorgehoben.
+    # ------------------------------------------------------------------
+    corrected_view = filtered.copy()
+    corrected_view["PNL vor Korrektur"] = pd.to_numeric(
+        corrected_view.get("PNL_Currency_Source", 0.0), errors="coerce"
+    ).fillna(0.0)
+    corrected_view["PNL nach Korrektur"] = pd.to_numeric(
+        corrected_view.get("PNL_Currency", 0.0), errors="coerce"
+    ).fillna(0.0)
+    corrected_view["Korrektur Δ"] = (
+        corrected_view["PNL nach Korrektur"] - corrected_view["PNL vor Korrektur"]
+    )
+    corrected_view["_corrected"] = corrected_view["Korrektur Δ"].abs() > 0.005
+
+    def correction_reason(row: pd.Series) -> str:
+        if not bool(row.get("_corrected", False)):
+            return "Keine Änderung"
+
+        ticks = normalize_number(row.get("PNL_Ticks", 0.0))
+        source_pnl = normalize_number(row.get("PNL vor Korrektur", 0.0))
+        source_contract = clean_label(row.get("SourceContract", ""), "UNKNOWN").upper()
+        display_contract = clean_label(row.get("DisplayContract", ""), DEFAULT_DISPLAY_CONTRACT).upper()
+
+        source_tick_value = CONTRACT_TICK_VALUES.get(source_contract)
+        source_mismatch = False
+        if ticks != 0 and source_tick_value is not None:
+            expected_source = ticks * float(source_tick_value)
+            source_mismatch = abs(source_pnl - expected_source) > 0.01
+
+        if ticks == 0 and source_pnl != 0:
+            return "Fallback: PNL_Ticks = 0"
+        if source_mismatch and source_contract != display_contract:
+            return "P/L-Quellabweichung + ES/MES-Normalisierung"
+        if source_mismatch:
+            return "P/L-Quellabweichung korrigiert"
+        if source_contract != display_contract:
+            return f"ES/MES-Normalisierung auf {display_contract}"
+        return "Dashboard-P/L aus PNL_Ticks neu berechnet"
+
+    corrected_view["Korrekturstatus"] = corrected_view["_corrected"].map(
+        {True: "KORRIGIERT", False: "UNVERÄNDERT"}
+    )
+    corrected_view["Korrekturgrund"] = corrected_view.apply(correction_reason, axis=1)
+
+    corrected_cols = [
+        "CSVLine", "EntryCSVLine", "DateTime", "EntryDateTime", "SessionDateTime",
+        "TradeSession", "TradeID", "Algo", "AlgoVersion", "Module", "TradeAccount",
+        "Symbol", "CountColor", "Direction", "EntryFillPrice", "ExitPrice",
+        "StopPrice", "TargetPrice", "RiskTicks", "RewardTicks", "Quantity",
+        "PNL_Ticks", "PNL vor Korrektur", "PNL nach Korrektur", "Korrektur Δ",
+        "Korrekturstatus", "Korrekturgrund", "SourceContract", "DisplayContract",
+        "DisplayTickValue", "MAE_Ticks", "MFE_Ticks", "ExitReason", "Notes",
+    ]
+    corrected_cols = [c for c in corrected_cols if c in corrected_view.columns]
+
+    corrected_display = corrected_view[corrected_cols + ["_corrected"]].sort_values(
+        "DateTime", ascending=False
+    )
+
+    def highlight_corrected_rows(row: pd.Series):
+        changed = bool(row.get("_corrected", False))
+        if changed:
+            return [
+                "background-color: #3b3218; color: #ffd86b; font-weight: 600;"
+                if col != "_corrected" else ""
+                for col in row.index
+            ]
+        return ["" for _ in row.index]
+
+    styled_corrected = (
+        corrected_display.style
+        .apply(highlight_corrected_rows, axis=1)
+        .format({
+            "PNL vor Korrektur": money,
+            "PNL nach Korrektur": money,
+            "Korrektur Δ": money,
+        })
+        .hide(axis="columns", subset=["_corrected"])
+    )
+
+    st.markdown(
+        '<div class="wt-section-title">Alle Trades · Dashboard-Werte mit Korrektur</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Vorher/Nachher-Vergleich. Gelb hervorgehobene Zeilen wurden für die Dashboard-Berechnung verändert. '
+        'Unveränderte Trades bleiben ohne Hervorhebung.</div>',
+        unsafe_allow_html=True,
+    )
+    st.dataframe(
+        styled_corrected,
+        use_container_width=True,
+        hide_index=True,
+        height=620,
+    )
+
+    # Bestehender vollständiger technischer Audit bleibt unverändert erhalten.
+    st.markdown(
+        '<div class="wt-section-title">Technischer Trade Audit Trail</div>',
         unsafe_allow_html=True,
     )
     cols = [
@@ -1716,6 +1858,7 @@ def trades_tab(filtered: pd.DataFrame) -> None:
         hide_index=True,
         height=620,
     )
+
     csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Gefilterte Closed Trades als CSV herunterladen",
