@@ -37,7 +37,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.13"
+APP_VERSION = "2.0.14"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -1484,19 +1484,7 @@ def source_status(info: Dict[str, Any], raw_df: pd.DataFrame, trades: pd.DataFra
     path = clean_label(info.get("path", ""), "–")
     loaded = clean_label(info.get("loaded_at", ""), "–")
     latest = latest_trade_label(trades)
-    st.markdown(
-        f"""
-        <div class="wt-status-grid">
-          <div class="wt-status-item"><div class="wt-status-k">Datenquelle</div><div class="wt-status-v">{html.escape(source.upper())}</div></div>
-          <div class="wt-status-item"><div class="wt-status-k">Letzter Closed Trade</div><div class="wt-status-v">{html.escape(latest)}</div></div>
-          <div class="wt-status-item"><div class="wt-status-k">CSV / Closed Rows</div><div class="wt-status-v">{len(raw_df):,} / {len(trades):,}</div></div>
-          <div class="wt-status-item"><div class="wt-status-k">Geladen</div><div class="wt-status-v">{html.escape(loaded)}</div></div>
-        </div>
-        <div class="wt-meta" style="margin-top:8px">Pfad: {html.escape(path)}</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    
 
 def show_data_quality_banner(raw_df: pd.DataFrame) -> None:
     """Compact always-visible source-vs-dashboard control status."""
