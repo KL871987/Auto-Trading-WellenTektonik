@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import csv
 import html
+import hashlib
 import io
 import os
 import re
@@ -37,7 +38,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.16"
+APP_VERSION = "2.0.18"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -466,7 +467,144 @@ def parse_csv(text: str) -> pd.DataFrame:
     # one-record-per-line, which makes this a reliable operator reference.
     if "CSVLine" not in df.columns:
         df["CSVLine"] = range(2, len(df) + 2)
-    return df
+    return adapt_input_schema(df)
+
+
+SIERRA_TRADES_REQUIRED_COLUMNS = {
+    "Trade Type",
+    "Symbol",
+    "Entry DateTime",
+    "Exit DateTime",
+    "Entry Price",
+    "Exit Price",
+    "Trade Quantity",
+    "Profit/Loss (T)",
+    "Account",
+}
+
+
+def _stable_sierra_trade_id(row: pd.Series) -> str:
+    """Create a stable internal ID for Sierra Trades rows.
+
+    The new Sierra Trade Activity Log -> Trades export contains a complete
+    closed trade in one row but no TradeID column. The hash is intentionally
+    based on execution fields, not CSV row number. If two legitimate limit
+    orders have identical execution data they receive the same logical ID;
+    both rows are still preserved and the existing Multi-Limit audit can show
+    them as informational repeated-looking trades.
+    """
+    values = [
+        clean_label(row.get("Account", ""), ""),
+        clean_label(row.get("Symbol", ""), ""),
+        clean_label(row.get("Entry DateTime", ""), ""),
+        clean_label(row.get("Exit DateTime", ""), ""),
+        clean_label(row.get("Entry Price", ""), ""),
+        clean_label(row.get("Exit Price", ""), ""),
+        clean_label(row.get("Trade Quantity", ""), ""),
+        clean_label(row.get("Profit/Loss (T)", ""), ""),
+        clean_label(row.get("Note", ""), ""),
+    ]
+    digest = hashlib.sha1("|".join(values).encode("utf-8", errors="replace")).hexdigest()[:18]
+    account = re.sub(r"[^A-Za-z0-9_-]+", "", values[0]) or "NA"
+    return f"SC-{account}-{digest}"
+
+
+def adapt_input_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Map supported source schemas into the dashboard's canonical fields.
+
+    Existing/legacy BlueBlack CSV:
+        Passed through unchanged.
+
+    New Sierra Chart source:
+        Sierra Chart -> Trade -> Trade Activity Log -> Trades
+        One source row already represents one completed trade. The adapter
+        creates the canonical fields expected by the dashboard without changing
+        any dashboard layout, filters, KPI logic, tabs, charts or audit features.
+
+    Fields not present in the new Sierra Trades export (for example original
+    StopPrice, TargetPrice, RiskTicks, RewardTicks and ExitReason) are not
+    invented. They stay empty/zero so the dashboard never fabricates trading
+    information that the source file does not provide.
+    """
+    if df.empty:
+        return df
+
+    cols = set(map(str, df.columns))
+    if not SIERRA_TRADES_REQUIRED_COLUMNS.issubset(cols):
+        # Existing BlueBlack format remains exactly as before.
+        return df
+
+    out = df.copy()
+    out["SourceFormat"] = "SIERRA_TRADE_ACTIVITY_TRADES"
+
+    # One Sierra Trades row is already a complete CLOSED trade.
+    out["RowType"] = "EXIT"
+    out["TradeAccount"] = safe_col(out, "Account", "").astype(str).str.strip()
+    out["TradeID"] = out.apply(_stable_sierra_trade_id, axis=1)
+
+    # Preserve physical CSV source references.
+    if "CSVLine" not in out.columns:
+        out["CSVLine"] = range(2, len(out) + 2)
+    out["EntryCSVLine"] = out["CSVLine"]
+
+    # Sierra Trade Activity Log supplies both entry and exit timestamps on the
+    # same row. DateTime remains the dashboard's closed-trade timestamp.
+    out["DateTime"] = safe_col(out, "Exit DateTime", "")
+    out["SignalDateTime"] = safe_col(out, "Entry DateTime", "")
+    out["EntryDateTime_Source"] = safe_col(out, "Entry DateTime", "")
+
+    # Normalize only the cosmetic [Sim] symbol prefix. Contract identity remains.
+    out["Symbol"] = (
+        safe_col(out, "Symbol", "")
+        .astype(str)
+        .str.replace(r"^\[Sim\]", "", regex=True)
+        .str.strip()
+    )
+    out["Direction"] = safe_col(out, "Trade Type", "").astype(str).str.upper().str.strip()
+
+    out["EntryFillPrice"] = safe_col(out, "Entry Price", "")
+    out["ExitPrice"] = safe_col(out, "Exit Price", "")
+    out["Quantity"] = safe_col(out, "Trade Quantity", "")
+    out["PNL_Ticks"] = safe_col(out, "Profit/Loss (T)", "")
+
+    # The new file has tick P/L but no PNL_Currency column. Build the audit-side
+    # source currency deterministically from the contract represented by Symbol.
+    # Dashboard performance still uses its existing canonical PNL_Ticks logic.
+    pnl_ticks = safe_col(out, "Profit/Loss (T)", "").map(normalize_number)
+    source_contract = out["Symbol"].map(detect_contract_from_symbol)
+    source_tick_value = source_contract.map(CONTRACT_TICK_VALUES).fillna(
+        CONTRACT_TICK_VALUES[DEFAULT_DISPLAY_CONTRACT]
+    )
+    out["PNL_Currency"] = pnl_ticks * source_tick_value
+
+    cumulative_ticks = safe_col(out, "Cumulative Profit/Loss (T)", "").map(normalize_number)
+    out["CumPNL_Currency"] = cumulative_ticks * source_tick_value
+
+    max_dd_ticks = safe_col(out, "Maximum Drawdown (T)", "").map(normalize_number)
+    out["MaxDrawdown_Currency"] = max_dd_ticks * source_tick_value
+
+    # MAE/MFE are available in the new Sierra source as Max Open Loss/Profit.
+    out["MAE_Ticks"] = safe_col(out, "Max Open Loss (T)", "").map(
+        lambda v: abs(normalize_number(v))
+    )
+    out["MFE_Ticks"] = safe_col(out, "Max Open Profit (T)", "").map(
+        lambda v: max(0.0, normalize_number(v))
+    )
+
+    # Preserve the source note verbatim for module/strategy metadata parsing.
+    out["Notes"] = safe_col(out, "Note", "").astype(str).str.strip()
+
+    # The following legacy BlueBlack fields are not present in Sierra's Trades
+    # list. Keep neutral values instead of inventing strategy parameters.
+    out["CountColor"] = ""
+    out["ExitReason"] = ""
+    out["EntryLevel4"] = 0.0
+    out["StopPrice"] = 0.0
+    out["TargetPrice"] = 0.0
+    out["RiskTicks"] = 0.0
+    out["RewardTicks"] = 0.0
+
+    return out
 
 
 def _first_nonempty(row: pd.Series, candidates: Iterable[str]) -> str:
@@ -482,8 +620,38 @@ def extract_module(notes: Any) -> str:
     text = clean_label(notes, "")
     if not text:
         return "Nicht angegeben"
+
+    # Existing BlueBlack format.
     m = re.search(r"(?:^|;)\s*Module=([^;]+)", text, flags=re.IGNORECASE)
-    return clean_label(m.group(1) if m else "", "Nicht angegeben")
+    if m:
+        return clean_label(m.group(1), "Nicht angegeben")
+
+    # New Sierra Trade Activity Log -> Trades Note formats.
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+    if parts:
+        head = parts[0].upper()
+        if head.startswith("WTROUND") and len(parts) >= 3:
+            return clean_label(parts[2], "Nicht angegeben")
+        if head == "WT_P3_LIFECYCLE_ROBUST" and len(parts) >= 2:
+            return clean_label(parts[1], "Nicht angegeben")
+        if head in {"WT-HCRV", "WT_HCRV"} and len(parts) >= 2:
+            return clean_label(parts[1], "Nicht angegeben")
+
+    upper = text.upper()
+    if upper == "WT_RTH_MAE200":
+        return "RTH_MAE200"
+    if upper == "WT_OVERNIGHT_MAE":
+        return "OVERNIGHT_MAE"
+
+    # Example: WT_HCRV_RTH_B_<id>_G1_TM_CHAMPION_V2_0
+    m = re.match(
+        r"WT_HCRV_(RTH_[AB])_\d+_(G1_TM_CHAMPION_V\d+_\d+)$",
+        upper,
+    )
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+
+    return "Nicht angegeben"
 
 
 def extract_version(notes: Any) -> str:
@@ -670,6 +838,20 @@ def prepare_trades(df: pd.DataFrame, display_contract: str = DEFAULT_DISPLAY_CON
         out = out.merge(entry_lookup_df, on=["TradeAccount", "TradeID"], how="left")
     else:
         out["EntryDateTime"] = pd.NaT
+
+    # New Sierra Trades schema already contains Entry DateTime on the same
+    # closed-trade row. Use it when no separate legacy ENTRY row exists.
+    direct_entry_dt = pd.to_datetime(
+        safe_col(out, "EntryDateTime_Source", ""), errors="coerce"
+    )
+    out["EntryDateTime"] = out["EntryDateTime"].where(
+        out["EntryDateTime"].notna(), direct_entry_dt
+    )
+    if "EntryCSVLine" not in out.columns:
+        out["EntryCSVLine"] = pd.to_numeric(
+            safe_col(out, "CSVLine", 0), errors="coerce"
+        ).fillna(0).astype(int)
+
     out["Symbol"] = safe_col(out, "Symbol", "").map(clean_label)
     out["CountColor"] = (
         safe_col(out, "CountColor", "")
@@ -1372,19 +1554,69 @@ def algo_color_map(trades: pd.DataFrame) -> Dict[str, str]:
 
 
 def sidebar_filters(trades: pd.DataFrame, session_view: str = DEFAULT_SESSION_VIEW) -> Tuple[pd.DataFrame, float]:
-    """Apply dashboard filters without leaking widget state between sessions.
+    """Apply dashboard filters without stale widget state across sessions/files.
 
-    Streamlit keeps widget values in session_state. In older dashboard versions,
-    changing RTH -> ETH/Globex could leave stale algorithm/technical-filter values
-    from the previous session. Those values were then applied to the new session
-    and could incorrectly produce an empty result set.
+    The dashboard keeps the same UI and filter functionality. The only additional
+    behavior is an internal reset when the underlying CSV dataset changes.
 
-    Every session now owns its own filter-state keys. Switching between Globex,
-    RTH and ETH therefore starts from the correct defaults for that session and
-    remembers later user choices independently.
+    This is necessary because Streamlit persists widget values in session_state.
+    If a previous CSV/date range contained only (for example) 21.08.2026, then
+    uploading a new CSV with 04.08–21.08 could otherwise leave the old 21.08
+    date filter active and make the dashboard appear to contain only one trade.
     """
     st.sidebar.markdown("### Portfolio Filter")
     st.sidebar.caption("Alle Filter wirken identisch auf KPI, Tabellen und Equity-Kurve.")
+
+    # ------------------------------------------------------------------
+    # Internal dataset fingerprint.
+    # No dashboard functionality/layout changes: this only detects when a new
+    # file/history has been loaded so old widget selections do not leak into it.
+    # ------------------------------------------------------------------
+    if trades.empty:
+        dataset_signature = "EMPTY"
+    else:
+        dt = pd.to_datetime(trades.get("DateTime", pd.Series(dtype="datetime64[ns]")), errors="coerce")
+        accounts = sorted(
+            trades.get("TradeAccount", pd.Series(dtype=str))
+            .fillna("").astype(str).unique().tolist(),
+            key=natural_algo_sort_key,
+        )
+        trade_ids = trades.get("TradeID", pd.Series(dtype=str)).fillna("").astype(str)
+        pnl_ticks = pd.to_numeric(
+            trades.get("PNL_Ticks", pd.Series(dtype=float)), errors="coerce"
+        ).fillna(0.0)
+
+        fingerprint_source = "|".join([
+            str(len(trades)),
+            str(dt.min()) if dt.notna().any() else "",
+            str(dt.max()) if dt.notna().any() else "",
+            ",".join(accounts),
+            str(len(set(trade_ids.tolist()))),
+            f"{float(pnl_ticks.sum()):.8f}",
+        ])
+        dataset_signature = hashlib.sha1(
+            fingerprint_source.encode("utf-8", errors="replace")
+        ).hexdigest()
+
+    previous_signature = st.session_state.get("_wt_filter_dataset_signature")
+    if previous_signature != dataset_signature:
+        # Remove only dashboard filter-widget state. Password/authentication,
+        # display contract and all other dashboard/session functionality remain.
+        keys_to_clear = []
+        for key in list(st.session_state.keys()):
+            if (
+                key.startswith("algorithms_")
+                or key.startswith("date_range_")
+                or key.startswith("filter_globex_")
+                or key.startswith("filter_rth_")
+                or key.startswith("filter_eth_")
+            ):
+                keys_to_clear.append(key)
+
+        for key in keys_to_clear:
+            st.session_state.pop(key, None)
+
+        st.session_state["_wt_filter_dataset_signature"] = dataset_signature
 
     risk_default = normalize_number(_secret("RISK_LIMIT_TICKS", "15")) or 15.0
     risk_limit_ticks = st.sidebar.number_input(
@@ -1403,9 +1635,7 @@ def sidebar_filters(trades: pd.DataFrame, session_view: str = DEFAULT_SESSION_VI
     if session_view in {"RTH", "ETH"} and "TradeSession" in out.columns:
         out = out[out["TradeSession"] == session_view]
 
-    # IMPORTANT: each session gets independent widget keys. This prevents an
-    # RTH selection from becoming an invalid hidden filter after switching to ETH
-    # or Globex.
+    # Each session keeps independent user-selected filters, as before.
     session_key = str(session_view).lower()
 
     algos = sorted(out["Algo"].dropna().astype(str).unique().tolist(), key=natural_algo_sort_key)
@@ -1423,21 +1653,37 @@ def sidebar_filters(trades: pd.DataFrame, session_view: str = DEFAULT_SESSION_VI
     if "DateTime" in out and out["DateTime"].notna().any():
         min_date = out["DateTime"].min().date()
         max_date = out["DateTime"].max().date()
+
+        date_key = f"date_range_{session_key}"
+
+        # Defensive clamp for a persisted value from an older history. Usually
+        # the dataset reset above already clears it, but this also protects
+        # against browser/session edge cases.
+        old_range = st.session_state.get(date_key)
+        if old_range is not None:
+            try:
+                values = list(old_range) if isinstance(old_range, (tuple, list)) else [old_range]
+                invalid = any(v < min_date or v > max_date for v in values if v is not None)
+                if invalid:
+                    st.session_state.pop(date_key, None)
+            except Exception:
+                st.session_state.pop(date_key, None)
+
         dr = st.sidebar.date_input(
             "Zeitraum",
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date,
-            key=f"date_range_{session_key}",
+            key=date_key,
         )
         if isinstance(dr, tuple) and len(dr) == 2:
-            start, end = dr
-            out = out[(out["DateTime"].dt.date >= start) & (out["DateTime"].dt.date <= end)]
+            start_date, end_date = dr
+            out = out[
+                (out["DateTime"].dt.date >= start_date)
+                & (out["DateTime"].dt.date <= end_date)
+            ]
 
     with st.sidebar.expander("Technische Filter", expanded=False):
-        # TradeSession is intentionally NOT repeated here: the dedicated global
-        # Session selector already controls Globex/RTH/ETH. A second hidden
-        # TradeSession multiselect was the main source of stale-state conflicts.
         for col, label in [
             ("TradeAccount", "Trade Account"),
             ("Symbol", "Symbol"),
@@ -2086,41 +2332,51 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
     entry_keys = set(zip(valid_entries["_Account"], valid_entries["_TradeID"]))
     exit_keys = set(zip(valid_exits["_Account"], valid_exits["_TradeID"]))
 
-    for account, trade_id in sorted(entry_keys - exit_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
-        g = valid_entries[(valid_entries["_Account"] == account) & (valid_entries["_TradeID"] == trade_id)]
-        lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
-        row = {
-            "Sim / Account": account_label(account),
-            "TradeID": trade_id,
-            "ENTRY CSV-Zeile(n)": lines,
-            "ENTRY DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
-            "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
-            "Fehler": "ENTRY vorhanden, EXIT fehlt",
-        }
-        missing_exit_rows.append(row)
-        add_issue(
-            "FEHLER", "ENTRY ohne EXIT", account_label(account), lines, trade_id,
-            row["Symbol"], row["ENTRY DateTime"],
-            "Trade wurde eröffnet/exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert kein EXIT.",
-        )
+    # Sierra Trade Activity Log -> Trades is a one-row-per-closed-trade format.
+    # Its Entry DateTime is embedded in the EXIT/closed row, so separate
+    # ENTRY/EXIT pairing checks are not applicable to that source schema.
+    self_contained_closed_source = bool(
+        "SourceFormat" in df.columns
+        and len(df) > 0
+        and df["SourceFormat"].astype(str).eq("SIERRA_TRADE_ACTIVITY_TRADES").all()
+    )
 
-    for account, trade_id in sorted(exit_keys - entry_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
-        g = valid_exits[(valid_exits["_Account"] == account) & (valid_exits["_TradeID"] == trade_id)]
-        lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
-        row = {
-            "Sim / Account": account_label(account),
-            "TradeID": trade_id,
-            "EXIT CSV-Zeile(n)": lines,
-            "EXIT DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
-            "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
-            "Fehler": "EXIT vorhanden, ENTRY fehlt",
-        }
-        missing_entry_rows.append(row)
-        add_issue(
-            "FEHLER", "EXIT ohne ENTRY", account_label(account), lines, trade_id,
-            row["Symbol"], row["EXIT DateTime"],
-            "Geschlossener Trade wurde exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert keine ENTRY-Zeile.",
-        )
+    if not self_contained_closed_source:
+        for account, trade_id in sorted(entry_keys - exit_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
+            g = valid_entries[(valid_entries["_Account"] == account) & (valid_entries["_TradeID"] == trade_id)]
+            lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
+            row = {
+                "Sim / Account": account_label(account),
+                "TradeID": trade_id,
+                "ENTRY CSV-Zeile(n)": lines,
+                "ENTRY DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
+                "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
+                "Fehler": "ENTRY vorhanden, EXIT fehlt",
+            }
+            missing_exit_rows.append(row)
+            add_issue(
+                "FEHLER", "ENTRY ohne EXIT", account_label(account), lines, trade_id,
+                row["Symbol"], row["ENTRY DateTime"],
+                "Trade wurde eröffnet/exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert kein EXIT.",
+            )
+
+        for account, trade_id in sorted(exit_keys - entry_keys, key=lambda x: (natural_algo_sort_key(x[0]), x[1])):
+            g = valid_exits[(valid_exits["_Account"] == account) & (valid_exits["_TradeID"] == trade_id)]
+            lines = ", ".join(map(str, sorted(g["CSVLine"].astype(int).tolist())))
+            row = {
+                "Sim / Account": account_label(account),
+                "TradeID": trade_id,
+                "EXIT CSV-Zeile(n)": lines,
+                "EXIT DateTime": clean_label(g.get("DateTime", pd.Series([""])).iloc[0], ""),
+                "Symbol": clean_label(g["_Symbol"].iloc[0], ""),
+                "Fehler": "EXIT vorhanden, ENTRY fehlt",
+            }
+            missing_entry_rows.append(row)
+            add_issue(
+                "FEHLER", "EXIT ohne ENTRY", account_label(account), lines, trade_id,
+                row["Symbol"], row["EXIT DateTime"],
+                "Geschlossener Trade wurde exportiert, aber für dieselbe Kombination aus TradeAccount + TradeID existiert keine ENTRY-Zeile.",
+            )
 
     # ------------------------------------------------------------------
     # 3) P/L plausibility: source dollars vs symbol contract tick value.
