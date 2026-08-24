@@ -38,7 +38,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.18"
+APP_VERSION = "2.0.19"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -321,19 +321,23 @@ def detect_contract_from_symbol(symbol: Any) -> str:
 
 
 def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.DataFrame:
-    """Standardize monetary P/L to the selected ES or MES tick basis.
+    """Display source monetary P/L on the selected ES/MES basis WITHOUT correction.
 
-    PNL_Ticks is the canonical realized price result. Therefore every trade with
-    a non-zero tick result is displayed as:
+    IMPORTANT:
+    - PNL_Currency from the uploaded/source file remains the authoritative
+      monetary value.
+    - PNL_Ticks is used only for Data Quality plausibility checks.
+    - The dashboard does NOT automatically replace, repair or overwrite a
+      source P/L value when PNL_Ticks and PNL_Currency disagree.
+    - The existing ES/MES selector remains available as an explicit display
+      conversion. If the selected display contract differs from the contract
+      identified by Symbol, the SOURCE dollar value is scaled by the normal
+      10:1 ES/MES tick-value relationship.
+    - If the source contract cannot be identified, the source dollar value is
+      shown unchanged.
 
-        PNL_Ticks × selected tick value
-
-    This makes the ES/MES selector deterministic and prevents mixed/incorrect
-    source-dollar scaling from changing portfolio statistics. The original
-    exported dollar P/L is preserved only for audit in PNL_Currency_Source.
-
-    ExportTickValue and PNL_Adjustment_Source describe how the source row appears
-    to have been monetized; they never alter standardized dashboard P/L.
+    Thus a faulty BlueBlack row remains faulty in the dashboard performance and
+    is only flagged in Data Quality; it is no longer silently corrected.
     """
     contract = str(display_contract or DEFAULT_DISPLAY_CONTRACT).upper().strip()
     if contract not in CONTRACT_TICK_VALUES:
@@ -344,6 +348,7 @@ def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.Da
     result["PNL_Currency_Source"] = pd.to_numeric(
         result.get("PNL_Currency", 0.0), errors="coerce"
     ).fillna(0.0)
+
     result["SourceContract"] = result.get(
         "Symbol", pd.Series("", index=result.index)
     ).map(detect_contract_from_symbol)
@@ -353,7 +358,8 @@ def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.Da
     ticks = pd.to_numeric(result.get("PNL_Ticks", 0.0), errors="coerce").fillna(0.0)
     source_pnl = result["PNL_Currency_Source"]
 
-    # Audit-only inference of the source monetary basis.
+    # Audit-only inference. These fields remain useful for Data Quality but are
+    # never used to repair the uploaded source value.
     observed_ratio = (source_pnl.abs() / ticks.abs().replace(0.0, pd.NA)).astype("Float64")
 
     def nearest_known_tick(value: Any) -> float:
@@ -371,28 +377,29 @@ def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.Da
 
     export_tick_value = observed_ratio.map(nearest_known_tick)
     symbol_tick_value = result["SourceContract"].map(CONTRACT_TICK_VALUES).astype("Float64")
-    export_tick_value = export_tick_value.fillna(symbol_tick_value).fillna(target_tick_value).astype(float)
-    result["ExportTickValue"] = export_tick_value
+    result["ExportTickValue"] = (
+        export_tick_value.fillna(symbol_tick_value).astype("Float64")
+    )
 
-    source_tick_component = ticks * export_tick_value
+    inferred_for_audit = result["ExportTickValue"].fillna(target_tick_value).astype(float)
+    source_tick_component = ticks * inferred_for_audit
     result["PNL_Adjustment_Source"] = (source_pnl - source_tick_component).astype(float)
 
-    # Canonical standardized display P/L. No source-dollar residual is carried
-    # into performance figures because the requested ES/MES view is a pure
-    # tick-value normalization.
-    normalized = ticks * target_tick_value
+    # NO AUTO-CORRECTION:
+    # Same source/display contract -> keep source dollars exactly unchanged.
+    # Different known contract -> explicit ES/MES display conversion only.
+    source_tick_by_symbol = result["SourceContract"].map(CONTRACT_TICK_VALUES)
+    conversion_factor = target_tick_value / pd.to_numeric(
+        source_tick_by_symbol, errors="coerce"
+    )
+    converted = source_pnl * conversion_factor.fillna(1.0)
 
-    # If a legacy row has non-zero dollars but zero ticks, PNL_Ticks cannot be
-    # used. Only for that exceptional row do we scale the source monetary value
-    # by its inferred/source contract basis.
-    fallback_mask = (ticks == 0.0) & (source_pnl != 0.0)
-    if fallback_mask.any():
-        base_tick = pd.to_numeric(export_tick_value, errors="coerce").replace(0.0, pd.NA)
-        factor = target_tick_value / base_tick
-        fallback = source_pnl * factor.fillna(1.0)
-        normalized = normalized.where(~fallback_mask, fallback)
+    same_or_unknown = (
+        result["SourceContract"].eq(contract)
+        | ~result["SourceContract"].isin(CONTRACT_TICK_VALUES.keys())
+    )
+    result["PNL_Currency"] = converted.where(~same_or_unknown, source_pnl).astype(float)
 
-    result["PNL_Currency"] = normalized.astype(float)
     return result
 
 
@@ -567,9 +574,11 @@ def adapt_input_schema(df: pd.DataFrame) -> pd.DataFrame:
     out["Quantity"] = safe_col(out, "Trade Quantity", "")
     out["PNL_Ticks"] = safe_col(out, "Profit/Loss (T)", "")
 
-    # The new file has tick P/L but no PNL_Currency column. Build the audit-side
-    # source currency deterministically from the contract represented by Symbol.
-    # Dashboard performance still uses its existing canonical PNL_Ticks logic.
+    # The new Sierra Trades file has no PNL_Currency column at all. For this
+    # source schema only, create the missing monetary field once from the actual
+    # Sierra tick result and symbol contract so the unchanged dashboard can read
+    # the file. This is schema adaptation, not correction of an existing
+    # BlueBlack PNL_Currency value.
     pnl_ticks = safe_col(out, "Profit/Loss (T)", "").map(normalize_number)
     source_contract = out["Symbol"].map(detect_contract_from_symbol)
     source_tick_value = source_contract.map(CONTRACT_TICK_VALUES).fillna(
@@ -1987,9 +1996,9 @@ def trades_tab(filtered: pd.DataFrame) -> None:
     )
 
     # ------------------------------------------------------------------
-    # Tabelle 2: vor/nach Korrektur. Die Performance-Basis des Dashboards
-    # bleibt unverändert: PNL_Ticks × gewählte ES/MES-Tickbasis.
-    # Nur tatsächlich veränderte Zeilen werden farblich hervorgehoben.
+    # Tabelle 2: Quelle vs. Dashboard-Anzeige.
+    # Es gibt KEINE automatische Fehlerkorrektur. Unterschiede entstehen nur,
+    # wenn der Benutzer bewusst auf eine andere ES/MES-Anzeigebasis umschaltet.
     # ------------------------------------------------------------------
     corrected_view = filtered.copy()
     corrected_view["PNL vor Korrektur"] = pd.to_numeric(
@@ -2005,31 +2014,23 @@ def trades_tab(filtered: pd.DataFrame) -> None:
 
     def correction_reason(row: pd.Series) -> str:
         if not bool(row.get("_corrected", False)):
-            return "Keine Änderung"
+            return "Keine Änderung – Quellwert unverändert"
 
-        ticks = normalize_number(row.get("PNL_Ticks", 0.0))
-        source_pnl = normalize_number(row.get("PNL vor Korrektur", 0.0))
-        source_contract = clean_label(row.get("SourceContract", ""), "UNKNOWN").upper()
-        display_contract = clean_label(row.get("DisplayContract", ""), DEFAULT_DISPLAY_CONTRACT).upper()
+        source_contract = clean_label(
+            row.get("SourceContract", ""), "UNKNOWN"
+        ).upper()
+        display_contract = clean_label(
+            row.get("DisplayContract", ""), DEFAULT_DISPLAY_CONTRACT
+        ).upper()
 
-        source_tick_value = CONTRACT_TICK_VALUES.get(source_contract)
-        source_mismatch = False
-        if ticks != 0 and source_tick_value is not None:
-            expected_source = ticks * float(source_tick_value)
-            source_mismatch = abs(source_pnl - expected_source) > 0.01
+        if source_contract in CONTRACT_TICK_VALUES and source_contract != display_contract:
+            return f"Nur ES/MES-Darstellungsumrechnung auf {display_contract}"
 
-        if ticks == 0 and source_pnl != 0:
-            return "Fallback: PNL_Ticks = 0"
-        if source_mismatch and source_contract != display_contract:
-            return "P/L-Quellabweichung + ES/MES-Normalisierung"
-        if source_mismatch:
-            return "P/L-Quellabweichung korrigiert"
-        if source_contract != display_contract:
-            return f"ES/MES-Normalisierung auf {display_contract}"
-        return "Dashboard-P/L aus PNL_Ticks neu berechnet"
+        return "Keine automatische Fehlerkorrektur"
+
 
     corrected_view["Korrekturstatus"] = corrected_view["_corrected"].map(
-        {True: "KORRIGIERT", False: "UNVERÄNDERT"}
+        {True: "UMGERECHNET", False: "UNVERÄNDERT"}
     )
     corrected_view["Korrekturgrund"] = corrected_view.apply(correction_reason, axis=1)
 
@@ -2380,8 +2381,8 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
 
     # ------------------------------------------------------------------
     # 3) P/L plausibility: source dollars vs symbol contract tick value.
-    # The dashboard performance still uses canonical PNL_Ticks, but source
-    # inconsistencies are surfaced here rather than silently trusted.
+    # Source inconsistencies are surfaced here only. They do not automatically
+    # change the monetary P/L used by the dashboard.
     # ------------------------------------------------------------------
     for _, row in exits.iterrows():
         sim = account_label(row["_Account"])
@@ -2413,7 +2414,7 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
                 "Diagnose": "Dollar-P/L ungleich 0 bei PNL_Ticks = 0.",
                 "Dashboard MES P/L": float(source_pnl) if source_contract == "UNKNOWN" else 0.0,
                 "Dashboard ES P/L": float(source_pnl) if source_contract == "UNKNOWN" else 0.0,
-                "Dashboard-Korrektur": "FALLBACK – PNL_Ticks ist 0; Quellwert bleibt nur in diesem Sonderfall Basis",
+                "Dashboard-Korrektur": "KEINE AUTO-KORREKTUR – Quellwert bleibt unverändert; Auffälligkeit wird nur angezeigt.",
             }
             pnl_rows.append(pnl_row)
             add_issue("FEHLER", "P/L-Plausibilität", sim, str(csv_line), trade_id, symbol, dt, pnl_row["Diagnose"])
@@ -2459,9 +2460,9 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
             "Implizit $/Tick": implied_tick,
             "Abweichung $": diff,
             "Diagnose": diagnosis,
-            "Dashboard MES P/L": float(ticks) * CONTRACT_TICK_VALUES["MES"],
-            "Dashboard ES P/L": float(ticks) * CONTRACT_TICK_VALUES["ES"],
-            "Dashboard-Korrektur": "AUTO-KORRIGIERT – Source-Dollarwert wird nicht für Performance verwendet; PNL_Ticks × gewählte Tickbasis",
+            "Dashboard MES P/L": float(source_pnl) * (CONTRACT_TICK_VALUES["MES"] / float(expected_tick)),
+            "Dashboard ES P/L": float(source_pnl) * (CONTRACT_TICK_VALUES["ES"] / float(expected_tick)),
+            "Dashboard-Korrektur": "KEINE AUTO-KORREKTUR – Quellwert bleibt Performancebasis; nur die gewählte ES/MES-Anzeige skaliert den Quellwert.",
         }
         pnl_rows.append(pnl_row)
         add_issue(severity, "P/L-Plausibilität", sim, str(csv_line), trade_id, symbol, dt, diagnosis)
@@ -2527,8 +2528,8 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
                 })
             if category == "P/L-Plausibilität":
                 return pd.Series({
-                    "Korrekturstatus": "AUTO-KORRIGIERT",
-                    "Dashboard-Maßnahme": "PNL_Currency_Source bleibt Auditwert; Performance wird aus PNL_Ticks × gewählter ES/MES-Tickbasis berechnet.",
+                    "Korrekturstatus": "NICHT KORRIGIERT",
+                    "Dashboard-Maßnahme": "Auffälligkeit wird angezeigt. PNL_Currency_Source bleibt unverändert die monetäre Performancebasis; keine automatische Reparatur aus PNL_Ticks.",
                     "Quellfix erforderlich": "JA" if severity == "FEHLER" else "PRÜFEN",
                 })
             if category == "ENTRY ohne EXIT":
@@ -2598,7 +2599,7 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
         elif entry_no_exit + exit_no_entry + struct > 0:
             dashboard_status = "SICHER BEHANDELT"
         else:
-            dashboard_status = "AUTO-KORRIGIERT"
+            dashboard_status = "NICHT KORRIGIERT"
 
         summary_rows.append({
             "Sim / Account": sim,
@@ -2638,13 +2639,16 @@ def build_data_quality_report(raw_df: pd.DataFrame) -> Dict[str, Any]:
     else:
         status = "OK"
 
-    # Only actual P/L source inconsistencies are auto-corrected here.
-    # Multi-ENTRY / Multi-EXIT rows are never removed or altered.
-    auto_corrected = int(len(pnl_df))
+    # Automatic source-value correction is intentionally disabled.
+    # P/L errors remain visible in Data Quality but are not repaired.
+    auto_corrected = 0
     safely_handled = int(len(missing_exits_df) + len(missing_entries_df) + structural_total)
-    dashboard_status = "OK" if (auto_corrected + safely_handled) == 0 else (
-        "BEREINIGT" if safely_handled == 0 else "BEREINIGT / QUELLFIX NÖTIG"
-    )
+    if hard_total == 0 and pnl_warnings_total == 0:
+        dashboard_status = "OK"
+    elif safely_handled > 0:
+        dashboard_status = "QUELLFEHLER SICHTBAR / FALLBACK"
+    else:
+        dashboard_status = "QUELLFEHLER SICHTBAR"
 
     metrics = {
         "source_rows": int(len(df)),
@@ -2693,7 +2697,7 @@ def style_quality_summary(df: pd.DataFrame):
         )
     if "Dashboard-Status" in df.columns:
         styled = styled.map(
-            lambda v: f"color: {POSITIVE}; font-weight: 700" if v in {"OK", "AUTO-KORRIGIERT", "SICHER BEHANDELT"} else "",
+            lambda v: f"color: {POSITIVE}; font-weight: 700" if v in {"OK", "SICHER BEHANDELT"} else "",
             subset=["Dashboard-Status"],
         )
     return styled
@@ -2778,7 +2782,7 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
     report = build_data_quality_report(raw_df)
     metrics = report["metrics"]
 
-    st.markdown('<div class="wt-section-title">Data Quality & Auto-Correction · BlueBlack</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wt-section-title">Data Quality · BlueBlack</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="wt-section-sub">Die Prüfung läuft direkt auf der Quelldatei vor Bereinigung und Performance-Berechnung. '
         'CSV-Zeile 1 ist die Kopfzeile; Datenzeilen beginnen bei Zeile 2. Mehrere ENTRY- und EXIT-Zeilen können bei Multi-Limit-/Multi-Entry-Setups '
@@ -2790,7 +2794,7 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
     status = metrics.get("status", "NO DATA")
     c1.metric("Quellstatus", status)
     c2.metric("Dashboard", metrics.get("dashboard_status", "–"))
-    c3.metric("Auto-korrigiert", metrics.get("auto_corrected", 0), help="Automatisch korrigierte P/L-Quellabweichungen. Mehrfach-ENTRY/EXIT werden nicht verändert.")
+    c3.metric("Auto-Korrektur", "DEAKTIVIERT", help="P/L-Quellabweichungen werden nur angezeigt und nicht automatisch verändert.")
     c4.metric("Mehrfach-EXIT", f"{metrics.get('duplicate_exit_groups', 0)} Gruppen", delta=f"{metrics.get('duplicate_exit_extra_rows', 0)} zusätzliche Zeilen", delta_color="off", help="Nur Info: mögliche legitime Multi-Limit-Ausführungen; keine Zeile wird entfernt.")
     c5.metric("P/L Quellfehler", metrics.get("pnl_errors", 0))
     c6.metric("Quellfix/Fallback", metrics.get("safely_handled", 0))
@@ -2801,9 +2805,9 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
         st.warning("Keine harten Datenfehler erkannt, aber mindestens eine Quellwarnung sollte geprüft werden.")
     else:
         st.error(
-            "Die BlueBlack-QUELLE enthält Fehler/Auffälligkeiten. Das Dashboard schützt seine Berechnung davor: "
-            "P/L-Abweichungen werden aus PNL_Ticks neu bewertet. Mehrfach-ENTRYs und Mehrfach-EXITs bleiben vollständig erhalten, "
-            "weil sie legitime Multi-Limit-Ausführungen sein können. Nicht rekonstruierbare Quelldaten werden nicht erfunden und bleiben als Quellfix sichtbar."
+            "Die BlueBlack-QUELLE enthält Fehler/Auffälligkeiten. Diese werden im Dashboard angezeigt, aber nicht automatisch korrigiert. "
+            "PNL_Currency aus der Quelle bleibt die monetäre Performancebasis. Mehrfach-ENTRYs und Mehrfach-EXITs bleiben vollständig erhalten, "
+            "weil sie legitime Multi-Limit-Ausführungen sein können."
         )
 
     st.markdown('<div class="wt-section-title">Fehlerübersicht nach Sim</div>', unsafe_allow_html=True)
@@ -2819,7 +2823,7 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
     else:
         st.dataframe(style_quality_summary(summary), use_container_width=True, hide_index=True, height=min(560, 80 + 38 * len(summary)))
 
-    st.markdown('<div class="wt-section-title">Dashboard-Korrekturprotokoll</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wt-section-title">Fehlerbehandlung / Korrekturstatus</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="wt-section-sub">Jeder erkannte Punkt zeigt nicht nur den Quellfehler, sondern auch exakt, wie das Dashboard ihn behandelt. '
         'Die BlueBlack-Datei selbst wird niemals stillschweigend verändert.</div>',
@@ -2827,7 +2831,7 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
     )
     issues = report["issues"]
     if issues.empty:
-        st.success("Keine Korrekturen nötig.")
+        st.success("Keine Auffälligkeiten mit Korrekturstatus.")
     else:
         ledger_cols = [c for c in [
             "Schweregrad", "Kategorie", "Sim / Account", "CSV-Zeile(n)", "TradeID", "Symbol",
@@ -2875,8 +2879,8 @@ def data_quality_tab(raw_df: pd.DataFrame) -> None:
     st.markdown(
         '<div class="wt-section-sub">Vergleich von PNL_Ticks und dem exportierten PNL_Currency mit der Tickbasis des Symbols. '
         'Beispiel: MES +7 Ticks müssen 8,75 $ entsprechen; 87,50 $ implizieren stattdessen 12,50 $/Tick und werden als Fehler markiert. '
-        'Kleine Restabweichungen werden separat als Warnung ausgewiesen. In den Performance-KPIs wird der Quell-Dollarwert bei vorhandenen '
-        'PNL_Ticks automatisch durch die kanonische Tick-Berechnung ersetzt; beide Werte bleiben im Audit sichtbar.</div>',
+        'Kleine Restabweichungen werden separat als Warnung ausgewiesen. Der Quell-Dollarwert wird dadurch nicht verändert. '
+        'PNL_Ticks dient ausschließlich zur Plausibilitätsprüfung; automatische P/L-Korrekturen sind deaktiviert.</div>',
         unsafe_allow_html=True,
     )
     pnl_checks = report["pnl_checks"]
@@ -2972,12 +2976,12 @@ Erkannt: **RTH {int(session_counts.get('RTH', 0))} · ETH {int(session_counts.ge
         f"""
 Aktuelle Anzeige-Basis: **{display_contract} = {num(tick_value, 2)} $ pro Tick**. Standard beim Start ist **ES**.
 
-- **PNL_Ticks ist die verbindliche Berechnungsbasis** für die Performance-Anzeige.
-- MES-Darstellung = `PNL_Ticks × 1,25 $`.
-- ES-Darstellung = `PNL_Ticks × 12,50 $`.
-- Dadurch können gemischte oder falsch monetarisierte Quellzeilen die Portfolio-Kennzahlen nicht mehr verfälschen.
-- Das ursprünglich exportierte Dollar-P/L bleibt unverändert in `PNL_Currency_Source`.
-- `ExportTickValue` und `PNL_Adjustment_Source` dienen nur dem Audit der Quelldatei und werden **nicht** in das standardisierte Dashboard-P/L eingerechnet.
+- **PNL_Currency aus der Quelldatei ist die verbindliche monetäre Performancebasis**.
+- `PNL_Ticks` wird für Data-Quality-Prüfungen verwendet, korrigiert den Quell-Dollarwert aber nicht automatisch.
+- Bei gleicher ES/MES-Basis bleibt `PNL_Currency` exakt unverändert.
+- Nur wenn du im Dashboard bewusst zwischen ES und MES wechselst, wird der Quell-Dollarwert entsprechend der Symbol-Kontraktbasis umgerechnet.
+- Erkannte Abweichungen zwischen `PNL_Ticks` und `PNL_Currency` bleiben im Data-Quality-Tab sichtbar.
+- `PNL_Currency_Source`, `ExportTickValue` und `PNL_Adjustment_Source` bleiben für den Audit erhalten.
 - Mehrere gleich aussehende ENTRY- oder EXIT-Zeilen werden **nicht** automatisch entfernt. Sie können echte Multi-Limit-/Multi-Entry-Trades sein und bleiben vollständig in den Kennzahlen enthalten.
 
 Erkannte Quellkontrakte: **ES {int(source_counts.get('ES', 0))} · MES {int(source_counts.get('MES', 0))} · UNKNOWN {int(source_counts.get('UNKNOWN', 0))}**.
@@ -3137,9 +3141,9 @@ def main() -> None:
         <div class="wt-disclosure">
           <strong>Performance disclosure:</strong> Angezeigt wird ausschließlich realisiertes P/L aus importierten geschlossenen Trades,
           normalisiert auf <strong>{html.escape(display_contract)} · {num(CONTRACT_TICK_VALUES[display_contract], 2)} $/Tick</strong>.
-          Die Performance wird verbindlich aus <code>PNL_Ticks × gewähltem Tickwert</code> berechnet.
-          Original-Dollarwerte bleiben im Audit als <code>PNL_Currency_Source</code> erhalten; <code>PNL_Adjustment_Source</code> ist ausschließlich ein Quellen-Auditfeld
-          und verändert die standardisierte Performance nicht. Gleich aussehende ENTRY-/EXIT-Zeilen werden nicht automatisch dedupliziert,
+          Die monetäre Performance basiert auf dem exportierten <code>PNL_Currency</code>-Quellwert.
+          Erkannte P/L-Abweichungen werden nicht automatisch korrigiert; <code>PNL_Ticks</code> dient hierfür nur als Audit-/Plausibilitätswert.
+          Ein Unterschied zur Quelle entsteht nur durch die bewusst gewählte ES/MES-Anzeigebasis. Gleich aussehende ENTRY-/EXIT-Zeilen werden nicht automatisch dedupliziert,
           weil sie legitime Multi-Limit-/Multi-Entry-Ausführungen darstellen können.
           Aktive Session: <strong>{html.escape(session_view)}</strong> (Globex = RTH + ETH; RTH 08:30–15:00 CT).
           Die aktuelle Datenmenge ist als <strong>{html.escape(mode)}</strong> erkannt.
