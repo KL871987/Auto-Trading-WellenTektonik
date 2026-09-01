@@ -38,7 +38,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.19"
+APP_VERSION = "2.0.20"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 DEFAULT_REFRESH_SECONDS = 60
 
@@ -1755,7 +1755,45 @@ def executive_tab(filtered: pd.DataFrame, summary: Dict[str, Any]) -> None:
         st.plotly_chart(make_daily_bar(filtered), use_container_width=True, config={"displayModeBar": False}, key="executive_daily_pnl")
     with c2:
         st.markdown('<div class="wt-section-title">P/L Contribution nach Algo</div>', unsafe_allow_html=True)
-        st.plotly_chart(make_algo_pnl_chart(filtered), use_container_width=True, config={"displayModeBar": False}, key="executive_algo_contribution")
+
+        contribution_view = filtered
+        valid_contribution_dates = (
+            filtered["DateTime"].dropna()
+            if "DateTime" in filtered.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+
+        if len(valid_contribution_dates) > 0:
+            contribution_min = valid_contribution_dates.min().to_pydatetime()
+            contribution_max = valid_contribution_dates.max().to_pydatetime()
+
+            if contribution_min < contribution_max:
+                contribution_cutoff = st.slider(
+                    "Historischer Stand",
+                    min_value=contribution_min,
+                    max_value=contribution_max,
+                    value=contribution_max,
+                    format="DD.MM.YYYY HH:mm",
+                    key="executive_algo_contribution_history_cutoff",
+                    help=(
+                        "Regler nach links bewegen, um zu sehen, wie die P/L Contribution "
+                        "der einzelnen Algos zu einem früheren Zeitpunkt ausgesehen hat."
+                    ),
+                )
+                contribution_view = filtered[
+                    filtered["DateTime"].notna()
+                    & (filtered["DateTime"] <= pd.Timestamp(contribution_cutoff))
+                ]
+                st.caption(
+                    f"Stand: {pd.Timestamp(contribution_cutoff).strftime('%d.%m.%Y %H:%M')}"
+                )
+
+        st.plotly_chart(
+            make_algo_pnl_chart(contribution_view),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="executive_algo_contribution",
+        )
 
     st.markdown('<div class="wt-section-title">Strategy Leaderboard</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1837,6 +1875,32 @@ def algos_tab(filtered: pd.DataFrame) -> None:
     c4.metric("Winrate", pct(sm["winrate"], 1))
     c5.metric("Max DD", money(sm["max_dd"]))
     st.plotly_chart(make_equity_drawdown_chart(detail), use_container_width=True, config={"displayModeBar": False}, key="algos_detail_equity_drawdown")
+
+    st.markdown(
+        f'<div class="wt-section-title">Trades · {html.escape(str(algo))}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Alle Trades des aktuell ausgewählten Algorithmus innerhalb der bestehenden Dashboard-Filter.</div>',
+        unsafe_allow_html=True,
+    )
+
+    algo_trade_cols = [
+        "CSVLine", "DateTime", "EntryDateTime", "TradeSession", "TradeID",
+        "TradeAccount", "Symbol", "Direction",
+        "EntryFillPrice", "ExitPrice", "StopPrice", "TargetPrice",
+        "RiskTicks", "RewardTicks", "Quantity",
+        "PNL_Ticks", "PNL_Currency",
+        "MAE_Ticks", "MFE_Ticks", "ExitReason", "Module",
+    ]
+    algo_trade_cols = [c for c in algo_trade_cols if c in detail.columns]
+
+    st.dataframe(
+        detail[algo_trade_cols].sort_values("DateTime", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        height=min(620, max(180, 75 + 35 * len(detail))),
+    )
 
 
 def performance_tab(filtered: pd.DataFrame) -> None:
