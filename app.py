@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional, Tuple
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -38,8 +39,9 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.20"
+APP_VERSION = "2.0.22"
 LOCAL_CSV = os.path.join("data", "trades.csv")
+SIERRA_MASTER_CSV = r"C:\SierraChart\Data\WT_BlueBlack_Level4_AutoTrader_Trades_377T.csv"
 DEFAULT_REFRESH_SECONDS = 60
 
 # Separate access protection for the sensitive Data Quality & Korrektur tab.
@@ -403,32 +405,93 @@ def normalize_pnl_to_contract(out: pd.DataFrame, display_contract: str) -> pd.Da
     return result
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_from_github(owner: str, repo: str, branch: str, data_path: str, token: str) -> Tuple[str, Dict[str, Any]]:
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{data_path}"
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_from_github_raw(
+    owner: str,
+    repo: str,
+    branch: str,
+    data_path: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Read the public dashboard CSV directly from GitHub Raw.
+
+    This intentionally avoids api.github.com so the Streamlit dashboard no
+    longer consumes GitHub REST API rate-limit quota on every refresh.
+    """
+    safe_owner = quote(str(owner).strip(), safe="")
+    safe_repo = quote(str(repo).strip(), safe="")
+    safe_branch = quote(str(branch or "main").strip(), safe="")
+    safe_path = quote(str(data_path or "data/trades.csv").strip(), safe="/")
+
+    minute_bucket = datetime.now().strftime("%Y%m%d%H%M")
+    url = (
+        f"https://raw.githubusercontent.com/"
+        f"{safe_owner}/{safe_repo}/{safe_branch}/{safe_path}"
+        f"?v={minute_bucket}"
+    )
+
     headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+        "Accept": "text/plain,*/*",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": "WT-Quant-Dashboard/2.0.22",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    params = {"ref": branch} if branch else {}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+
+    r = requests.get(url, headers=headers, timeout=20)
     if r.status_code == 404:
-        raise FileNotFoundError(f"GitHub-Datei nicht gefunden: {owner}/{repo}/{data_path} auf Branch {branch}")
+        raise FileNotFoundError(
+            f"GitHub-Raw-Datei nicht gefunden: "
+            f"{owner}/{repo}/{data_path} auf Branch {branch}"
+        )
     r.raise_for_status()
-    meta = r.json()
-    content = base64.b64decode(meta.get("content", "")).decode("utf-8-sig", errors="replace")
+
+    content = r.content.decode("utf-8-sig", errors="replace")
     info = {
-        "source": "github",
+        "source": "github-raw",
         "path": f"{owner}/{repo}/{data_path}",
         "branch": branch,
-        "sha": meta.get("sha", ""),
-        "size": meta.get("size", 0),
-        "download_url": meta.get("download_url", ""),
+        "size": len(r.content),
         "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw_url": (
+            f"https://raw.githubusercontent.com/"
+            f"{safe_owner}/{safe_repo}/{safe_branch}/{safe_path}"
+        ),
     }
     return content, info
+
+
+def fetch_from_github(
+    owner: str,
+    repo: str,
+    branch: str,
+    data_path: str,
+    token: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """GitHub Raw reader with a session-local last-good fallback.
+
+    `token` remains in the signature so existing configuration/secrets stay
+    compatible, but reading no longer uses the GitHub REST API.
+    """
+    try:
+        content, info = _fetch_from_github_raw(
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            data_path=data_path,
+        )
+        st.session_state["_wt_last_good_github_csv"] = content
+        st.session_state["_wt_last_good_github_info"] = dict(info)
+        return content, info
+    except Exception:
+        last_good = st.session_state.get("_wt_last_good_github_csv")
+        last_info = st.session_state.get("_wt_last_good_github_info")
+
+        if isinstance(last_good, str) and last_good.strip():
+            info = dict(last_info) if isinstance(last_info, dict) else {}
+            info["source"] = "github-raw-last-good"
+            info["loaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            info["fallback"] = True
+            return last_good, info
+        raise
 
 
 def read_local_csv(path: str = LOCAL_CSV) -> Tuple[str, Dict[str, Any]]:
@@ -1716,18 +1779,47 @@ def sidebar_filters(trades: pd.DataFrame, session_view: str = DEFAULT_SESSION_VI
 
 
 def load_data() -> Tuple[pd.DataFrame, Dict[str, Any], str]:
+    """Load the freshest available trade source without changing dashboard behavior.
+
+    Priority:
+    1. Manual CSV upload (existing behavior).
+    2. Exact Sierra master file on the Windows trading PC, when it exists:
+       C:\\SierraChart\\Data\\WT_BlueBlack_Level4_AutoTrader_Trades_377T.csv
+    3. GitHub data/trades.csv (Streamlit Cloud / existing production path).
+    4. Existing local project fallback data/trades.csv.
+
+    This fixes the local dashboard reading a possibly older GitHub copy while the
+    current Sierra master file already contains newer trades. On Streamlit Cloud
+    the Windows path cannot exist, so production continues to use GitHub exactly
+    as before.
+    """
     gh = get_github_config()
+
     uploaded = st.sidebar.file_uploader("CSV manuell testen", type=["csv", "txt"])
     if uploaded is not None:
         uploaded_text = uploaded.getvalue().decode("utf-8-sig", errors="replace")
         return (
             parse_csv(uploaded_text),
-            {"source": "upload", "path": uploaded.name, "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            {
+                "source": "upload",
+                "path": uploaded.name,
+                "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
             uploaded_text,
         )
 
+    # On the actual Windows Sierra trading PC, always prefer the current master
+    # database over a potentially delayed GitHub copy.
+    if os.path.exists(SIERRA_MASTER_CSV):
+        content, info = read_local_csv(SIERRA_MASTER_CSV)
+        info["source"] = "sierra-local"
+        return parse_csv(content), info, content
+
+    # Existing Streamlit Cloud / GitHub behavior remains unchanged.
     if gh.owner and gh.repo:
-        content, info = fetch_from_github(gh.owner, gh.repo, gh.branch, gh.data_path, gh.token)
+        content, info = fetch_from_github(
+            gh.owner, gh.repo, gh.branch, gh.data_path, gh.token
+        )
         return parse_csv(content), info, content
 
     content, info = read_local_csv(LOCAL_CSV)
