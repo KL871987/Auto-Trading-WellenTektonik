@@ -39,7 +39,7 @@ import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
 APP_TITLE = "WT Quant Systems | Portfolio Analytics"
-APP_VERSION = "2.0.22"
+APP_VERSION = "2.1.1"
 LOCAL_CSV = os.path.join("data", "trades.csv")
 SIERRA_MASTER_CSV = r"C:\SierraChart\Data\WT_BlueBlack_Level4_AutoTrader_Trades_377T.csv"
 DEFAULT_REFRESH_SECONDS = 60
@@ -229,6 +229,208 @@ def inject_css() -> None:
         @media (max-width: 1050px) {{
             .wt-hero {{ grid-template-columns:1fr; }}
             .wt-status-grid {{ grid-template-columns:repeat(2, minmax(0,1fr)); }}
+        }}
+
+        /* Mobile / small-screen optimization. Desktop stays unchanged. */
+        @media (max-width: 768px) {{
+            .block-container {{
+                max-width: 100%;
+                padding-top: .75rem;
+                padding-left: .70rem;
+                padding-right: .70rem;
+                padding-bottom: 2rem;
+            }}
+
+            .wt-topline {{
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+                margin-bottom: 10px;
+            }}
+
+            .wt-brand {{
+                font-size: .64rem;
+                letter-spacing: .12em;
+            }}
+
+            .wt-title {{
+                font-size: 1.35rem;
+                line-height: 1.12;
+            }}
+
+            .wt-subtitle {{
+                font-size: .78rem;
+                line-height: 1.35;
+            }}
+
+            .wt-badge {{
+                max-width: 100%;
+                white-space: normal;
+                line-height: 1.25;
+                padding: 6px 9px;
+                font-size: .68rem;
+            }}
+
+            .wt-hero {{
+                grid-template-columns: 1fr;
+                gap: 8px;
+                margin: 8px 0 10px 0;
+            }}
+
+            .wt-card {{
+                padding: 14px 14px;
+                border-radius: 11px;
+            }}
+
+            .wt-label {{
+                font-size: .65rem;
+                letter-spacing: .06em;
+            }}
+
+            .wt-value {{
+                font-size: 1.95rem;
+                margin-top: 6px;
+            }}
+
+            .wt-value.small {{
+                font-size: 1.35rem;
+            }}
+
+            .wt-meta {{
+                font-size: .74rem;
+                margin-top: 7px;
+                line-height: 1.4;
+            }}
+
+            .wt-section-title {{
+                font-size: .98rem;
+                margin: 10px 0 3px 0;
+            }}
+
+            .wt-section-sub {{
+                font-size: .74rem;
+                line-height: 1.38;
+                margin-bottom: 7px;
+            }}
+
+            .wt-status-grid {{
+                grid-template-columns: 1fr;
+                gap: 7px;
+            }}
+
+            .wt-status-item {{
+                padding: 10px 11px;
+            }}
+
+            .wt-status-k {{
+                font-size: .64rem;
+            }}
+
+            .wt-status-v {{
+                font-size: .84rem;
+            }}
+
+            /* Main and per-algo tabs scroll horizontally on phones. */
+            [data-baseweb="tab-list"] {{
+                overflow-x: auto;
+                overflow-y: hidden;
+                white-space: nowrap;
+                flex-wrap: nowrap;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: thin;
+                gap: 2px;
+                padding-bottom: 2px;
+            }}
+
+            [data-baseweb="tab"] {{
+                flex: 0 0 auto;
+                min-width: max-content;
+                height: 40px;
+                padding-left: 10px;
+                padding-right: 10px;
+                font-size: .80rem;
+            }}
+
+            [data-testid="stMetric"] {{
+                min-height: 88px;
+                padding: 10px 11px;
+                border-radius: 10px;
+            }}
+
+            [data-testid="stMetricLabel"] {{
+                font-size: .70rem;
+            }}
+
+            [data-testid="stMetricValue"] {{
+                font-size: clamp(1.10rem, 6vw, 1.55rem);
+                line-height: 1.15;
+                overflow-wrap: anywhere;
+            }}
+
+            [data-testid="stMetricDelta"] {{
+                font-size: .68rem;
+            }}
+
+            [data-testid="stHorizontalBlock"] {{
+                gap: .45rem;
+            }}
+
+            [data-testid="column"] {{
+                min-width: 0;
+            }}
+
+            /* Tables remain usable by horizontal touch scroll. */
+            [data-testid="stDataFrame"],
+            [data-testid="stTable"] {{
+                max-width: 100%;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }}
+
+            /* Larger touch targets in sidebar controls. */
+            [data-testid="stSidebar"] button,
+            [data-testid="stSidebar"] input,
+            [data-testid="stSidebar"] [role="combobox"] {{
+                min-height: 40px;
+            }}
+
+            [data-testid="stSidebar"] {{
+                min-width: min(88vw, 330px);
+                max-width: min(88vw, 330px);
+            }}
+
+            [data-testid="stPlotlyChart"] {{
+                max-width: 100%;
+                overflow-x: hidden;
+            }}
+
+            .wt-disclosure {{
+                font-size: .68rem;
+                line-height: 1.45;
+                margin-top: 16px;
+                padding-top: 10px;
+            }}
+        }}
+
+        @media (max-width: 420px) {{
+            .block-container {{
+                padding-left: .50rem;
+                padding-right: .50rem;
+            }}
+
+            .wt-title {{
+                font-size: 1.22rem;
+            }}
+
+            .wt-value {{
+                font-size: 1.72rem;
+            }}
+
+            [data-baseweb="tab"] {{
+                padding-left: 8px;
+                padding-right: 8px;
+                font-size: .76rem;
+            }}
         }}
         </style>
         """,
@@ -2053,21 +2255,32 @@ def risk_tab(filtered: pd.DataFrame, risk_limit_ticks: float) -> None:
             st.dataframe(violations[show].sort_values("DateTime", ascending=False), use_container_width=True, hide_index=True)
 
 
-def require_trades_audit_access() -> bool:
-    """Gate the Trades & Audit area behind the same fixed password.
+def _safe_widget_key(value: Any) -> str:
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
+    return text or "default"
 
-    Authentication is remembered only for the current Streamlit browser session.
-    This is intentionally separate from the Data Quality unlock state, so each
-    protected tab can be locked/unlocked independently.
+
+def require_trades_audit_access(scope: str = "portfolio") -> bool:
+    """Gate every Trades & Audit area behind the same fixed password.
+
+    The password/authentication state is shared across the portfolio and all
+    algorithm tabs. Once unlocked in this browser session, all Trades & Audit
+    views are unlocked. Widget keys remain unique per scope so dynamic algo tabs
+    never collide with each other.
     """
     auth_key = "trades_audit_auth_ok"
+    scope_key = _safe_widget_key(scope)
 
     if st.session_state.get(auth_key) is True:
         c1, c2 = st.columns([5, 1])
         with c1:
             st.success("Trades & Audit ist entsperrt.")
         with c2:
-            if st.button("Bereich sperren", key="lock_trades_audit", use_container_width=True):
+            if st.button(
+                "Bereich sperren",
+                key=f"lock_trades_audit_{scope_key}",
+                use_container_width=True,
+            ):
                 st.session_state[auth_key] = False
                 st.rerun()
         return True
@@ -2082,12 +2295,12 @@ def require_trades_audit_access() -> bool:
         unsafe_allow_html=True,
     )
 
-    with st.form("trades_audit_login_form", clear_on_submit=True):
+    with st.form(f"trades_audit_login_form_{scope_key}", clear_on_submit=True):
         entered = st.text_input(
             "Passwort",
             type="password",
             placeholder="Passwort eingeben",
-            key="trades_audit_password_input",
+            key=f"trades_audit_password_input_{scope_key}",
         )
         submitted = st.form_submit_button(
             "Trades & Audit entsperren",
@@ -2105,8 +2318,8 @@ def require_trades_audit_access() -> bool:
     return False
 
 
-def trades_tab(filtered: pd.DataFrame) -> None:
-    if not require_trades_audit_access():
+def trades_tab(filtered: pd.DataFrame, scope: str = "portfolio") -> None:
+    if not require_trades_audit_access(scope):
         return
 
     st.markdown('<div class="wt-section-title">Trade Audit Trail</div>', unsafe_allow_html=True)
@@ -3184,8 +3397,273 @@ Erkannte Quellkontrakte: **ES {int(source_counts.get('ES', 0))} · MES {int(sour
             st.code(f"GitHub SHA: {info.get('sha')}")
 
 
+
+def show_algo_hero(algo: str, summary: Dict[str, Any], trades: pd.DataFrame) -> None:
+    """Same headline information as the main overview, scoped to one algo."""
+    gross = summary["gross_profit"] + abs(summary["gross_loss"])
+    st.markdown(
+        f"""
+        <div class="wt-hero">
+          <div class="wt-card primary">
+            <div class="wt-label">Realized {html.escape(str(algo))} P/L · {html.escape(period_label(trades))}</div>
+            <div class="wt-value {pnl_css(summary['net'])}">{money(summary['net'])}</div>
+            <div class="wt-meta">
+              <strong>{summary['trades']} geschlossene Trades</strong> ·
+              {summary['wins']} Gewinner / {summary['losses']} Verlierer ·
+              Brutto-Umsatz P/L {money(gross)}<br>
+              Alle Werte basieren ausschließlich auf den aktuell gefilterten Trades dieses Algos.
+            </div>
+          </div>
+          <div class="wt-card">
+            <div class="wt-label">Max Drawdown</div>
+            <div class="wt-value small negative">{money(summary['max_dd'])}</div>
+            <div class="wt-meta">Recovery Factor <strong>{num(summary['recovery'], 2)}</strong><br>
+            Profit Factor <strong>{num(summary['profit_factor'], 2)}</strong></div>
+          </div>
+          <div class="wt-card">
+            <div class="wt-label">Trade Quality</div>
+            <div class="wt-value small">{pct(summary['winrate'], 1)}</div>
+            <div class="wt-meta">Ø Trade <strong>{money(summary['avg_trade'])}</strong><br>
+            Payoff Ratio <strong>{num(summary['payoff'], 2)}</strong></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def algo_overview_workspace(
+    detail: pd.DataFrame,
+    algo: str,
+    summary: Dict[str, Any],
+    key_prefix: str,
+) -> None:
+    show_algo_hero(algo, summary, detail)
+    show_kpis(summary)
+
+    st.markdown(
+        f'<div class="wt-section-title">{html.escape(str(algo))} Performance</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="wt-section-sub">Equity und Drawdown ausschließlich für diesen Algorithmus.</div>',
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(
+        make_equity_drawdown_chart(detail),
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key=f"{key_prefix}_overview_equity_drawdown",
+    )
+
+    c1, c2 = st.columns([1.05, 1], gap="large")
+    with c1:
+        st.markdown('<div class="wt-section-title">Tages P/L</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            make_daily_bar(detail),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{key_prefix}_overview_daily_pnl",
+        )
+    with c2:
+        st.markdown('<div class="wt-section-title">Long / Short Contribution</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            make_direction_chart(detail),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{key_prefix}_overview_direction",
+        )
+
+    st.markdown('<div class="wt-section-title">Algo Kennzahlen</div>', unsafe_allow_html=True)
+    one_algo = strategy_table(detail)
+    if not one_algo.empty:
+        st.dataframe(
+            style_performance_table(
+                one_algo[
+                    [
+                        "Algo", "Trades", "Net P/L", "Profit Factor", "Winrate %",
+                        "Ø Trade", "Max DD", "Best", "Worst", "Last Trade"
+                    ]
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+            height=130,
+        )
+
+
+def algo_performance_workspace(
+    detail: pd.DataFrame,
+    key_prefix: str,
+) -> None:
+    c1, c2 = st.columns([1.15, 0.85], gap="large")
+
+    with c1:
+        st.markdown('<div class="wt-section-title">Perioden-Analyse</div>', unsafe_allow_html=True)
+        level = st.radio(
+            "Aggregation",
+            ["Day", "Week", "Month", "Year"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key=f"{key_prefix}_performance_aggregation",
+        )
+        tbl = group_table(detail, level)
+        st.dataframe(
+            style_performance_table(tbl),
+            use_container_width=True,
+            hide_index=True,
+            height=450,
+        )
+
+    with c2:
+        st.markdown('<div class="wt-section-title">Long / Short Contribution</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            make_direction_chart(detail),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{key_prefix}_performance_direction",
+        )
+
+        st.markdown('<div class="wt-section-title">Streaks & Trading Days</div>', unsafe_allow_html=True)
+        sm = calc_summary(detail)
+        a, b = st.columns(2)
+        a.metric("Max Win Streak", sm["win_streak"])
+        b.metric("Max Loss Streak", sm["loss_streak"])
+        a.metric("Profitable Tage", pct(sm["profitable_days"], 1))
+        b.metric("Handelstage", sm["days"])
+
+    st.markdown('<div class="wt-section-title">Kumulierte Performance</div>', unsafe_allow_html=True)
+    st.plotly_chart(
+        make_equity_drawdown_chart(detail),
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key=f"{key_prefix}_performance_equity",
+    )
+
+
+def algo_risk_workspace(
+    detail: pd.DataFrame,
+    risk_limit_ticks: float,
+    key_prefix: str,
+) -> None:
+    st.markdown('<div class="wt-section-title">Risk & Trade Quality</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="wt-section-sub">Risk-Monitor nur für diesen Algo: RiskTicks &gt; {num(risk_limit_ticks, 0)}.</div>',
+        unsafe_allow_html=True,
+    )
+
+    violations = (
+        detail[detail["RiskViolation"] == True]
+        if "RiskViolation" in detail
+        else pd.DataFrame()
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Risk-Verstöße", int(len(violations)))
+    c2.metric("Max RiskTicks", num(float(detail["RiskTicks"].max()) if len(detail) else 0, 1))
+    c3.metric("Ø RiskTicks", num(float(detail["RiskTicks"].mean()) if len(detail) else 0, 1))
+    c4.metric("Ø MAE", num(float(detail["MAE_Ticks"].mean()) if len(detail) else 0, 1))
+    c5.metric("Ø MFE", num(float(detail["MFE_Ticks"].mean()) if len(detail) else 0, 1))
+
+    c1, c2 = st.columns([1, 1], gap="large")
+    with c1:
+        st.markdown('<div class="wt-section-title">MAE / MFE Map</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            make_mae_mfe_chart(detail),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{key_prefix}_risk_mae_mfe",
+        )
+
+    with c2:
+        st.markdown('<div class="wt-section-title">P/L nach Exit Reason</div>', unsafe_allow_html=True)
+        st.plotly_chart(
+            make_exit_reason_chart(detail),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"{key_prefix}_risk_exit_reason",
+        )
+
+    rr = risk_reward_table(detail)
+    st.markdown('<div class="wt-section-title">Risk-to-Reward</div>', unsafe_allow_html=True)
+    if rr.empty:
+        st.info("Keine Risk-to-Reward-Daten für diesen Algo vorhanden.")
+    else:
+        st.dataframe(
+            style_risk_reward_table(rr),
+            use_container_width=True,
+            hide_index=True,
+            height=min(220, 80 + 38 * len(rr)),
+        )
+
+    if len(violations):
+        with st.expander(
+            f"{len(violations)} Risk-Monitor Treffer anzeigen",
+            expanded=False,
+        ):
+            show = [
+                c for c in [
+                    "DateTime", "EntryDateTime", "SessionDateTime", "TradeSession",
+                    "Algo", "Module", "TradeAccount", "Direction", "RiskTicks",
+                    "PNL_Currency", "ExitReason", "TradeID"
+                ]
+                if c in violations.columns
+            ]
+            st.dataframe(
+                violations[show].sort_values("DateTime", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def algo_workspace_tab(
+    filtered: pd.DataFrame,
+    algo: str,
+    risk_limit_ticks: float,
+) -> None:
+    """Full single-algo workspace with the same dashboard logic and filters."""
+    key_prefix = f"algo_{_safe_widget_key(algo)}"
+    detail = recompute_curve(
+        filtered[filtered["Algo"] == algo],
+        risk_limit_ticks=risk_limit_ticks,
+    )
+
+    if detail.empty:
+        st.info(f"Keine Trades für {algo} in der aktuellen Filterung.")
+        return
+
+    summary = calc_summary(detail)
+
+    st.markdown(
+        f"""
+        <div style="margin:8px 0 14px 0">
+          <div class="wt-brand">Algorithm Workspace</div>
+          <div class="wt-title">{html.escape(str(algo))}</div>
+          <div class="wt-subtitle">Übersicht · Performance · Risk & Qualität · Trades & Audit</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    algo_tabs = st.tabs(
+        ["Übersicht", "Performance", "Risk & Qualität", "Trades & Audit"]
+    )
+
+    with algo_tabs[0]:
+        algo_overview_workspace(detail, algo, summary, key_prefix)
+
+    with algo_tabs[1]:
+        algo_performance_workspace(detail, key_prefix)
+
+    with algo_tabs[2]:
+        algo_risk_workspace(detail, risk_limit_ticks, key_prefix)
+
+    with algo_tabs[3]:
+        trades_tab(detail, scope=key_prefix)
+
+
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide", initial_sidebar_state="auto")
     inject_css()
     require_password()
 
@@ -3266,7 +3744,7 @@ def main() -> None:
     show_hero(summary, filtered)
     show_kpis(summary)
 
-    tabs = st.tabs([
+    base_tab_names = [
         "Executive",
         "Algorithmen",
         "Performance",
@@ -3274,7 +3752,12 @@ def main() -> None:
         "Trades & Audit",
         "Data Quality & Korrektur",
         "Data / System",
-    ])
+    ]
+    algo_tab_names = sorted(
+        filtered["Algo"].dropna().astype(str).unique().tolist(),
+        key=natural_algo_sort_key,
+    )
+    tabs = st.tabs(base_tab_names + algo_tab_names)
 
     with tabs[0]:
         executive_tab(filtered, summary)
@@ -3290,6 +3773,13 @@ def main() -> None:
         data_quality_tab(raw_df)
     with tabs[6]:
         system_tab(raw_df, trades, filtered, info, session_view)
+
+    # Dynamic single-algo workspaces. New Sim/Algo accounts appear automatically
+    # and removed accounts disappear automatically according to the active data
+    # and sidebar filters.
+    for idx, algo in enumerate(algo_tab_names, start=len(base_tab_names)):
+        with tabs[idx]:
+            algo_workspace_tab(filtered, algo, risk_limit_ticks)
 
     mode = execution_mode(filtered)
     st.markdown(
